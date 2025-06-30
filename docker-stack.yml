@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  aitigos_service:
+    image: aitigos_service:latest
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.hostname == ednu03
+      restart_policy:
+        condition: on-failure
+    ports:
+      - "8011:8000"
+    volumes:
+      - aitigos_temp_uploads:/app/data/temp_uploads
+      - aitigos_results:/app/data/results
+      - aitigos_converted:/app/data/converted_images
+    environment:
+      - GEMINI_API_KEY=AIzaSyAJhbYATXKbh0ZcmiaC3zpwAHWQFc0bVJU
+      - GEMINI_MODEL=gemini-2.0-flash
+      - LOG_LEVEL=INFO
+      - LOG_FORMAT=%(asctime)s - %(name)s - %(levelname)s - %(message)s
+      - CLEANUP_INTERVAL_HOURS=6
+      - TEMP_RETENTION_HOURS=24
+      - RESULTS_RETENTION_HOURS=72
+    networks:
+      - traefik_proxy
+
+volumes:
+  aitigos_temp_uploads:
+  aitigos_results:
+  aitigos_converted:
+
+networks:
+  traefik_proxy:
+    external: true

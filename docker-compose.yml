@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    container_name: doc-extractor
+    restart: unless-stopped
+    ports:
+      - "8001:8000"
+    volumes:
+      - ./app/data/temp_uploads:/app/data/temp_uploads
+      - ./app/data/results:/app/data/results
+      - ./app/data/converted_images:/app/data/converted_images
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - LOG_LEVEL=INFO
+      - CLEANUP_INTERVAL_HOURS=6
+      - TEMP_RETENTION_HOURS=24
+      - RESULTS_RETENTION_HOURS=72
+    env_file:
+      - .env

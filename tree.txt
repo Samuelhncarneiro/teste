@@ -1,0 +1,46 @@
+.
+├── app
+│   ├── config.py
+│   ├── data
+│   │   ├── converted_images
+│   │   ├── __pycache__
+│   │   │   └── reference_data.cpython-312.pyc
+│   │   ├── reference_data.py
+│   │   ├── results
+│   │   └── temp_uploads
+│   ├── extractors
+│   │   ├── base.py
+│   │   ├── context_agent.py
+│   │   ├── extraction_agent.py
+│   │   ├── gemini_extractor.py
+│   │   └── __pycache__
+│   │       ├── base.cpython-312.pyc
+│   │       ├── context_agent.cpython-312.pyc
+│   │       ├── extraction_agent.cpython-312.pyc
+│   │       ├── gemini_extractor.cpython-312.pyc
+│   │       ├── hybrid_extractor.cpython-312.pyc
+│   │       └── llama_context_agent.cpython-312.pyc
+│   ├── main.py
+│   ├── models
+│   │   ├── __pycache__
+│   │   │   └── schemas.cpython-312.pyc
+│   │   └── schemas.py
+│   ├── __pycache__
+│   │   ├── config.cpython-312.pyc
+│   │   └── main.cpython-312.pyc
+│   ├── services
+│   │   ├── cleanup_service.py
+│   │   ├── document_service.py
+│   │   ├── job_service.py
+│   │   └── __pycache__
+│   │       ├── document_service.cpython-312.pyc
+│   │       ├── job_service.cpython-312.pyc
+│   │       └── mapping_service.cpython-312.pyc
+│   └── utils
+│       ├── file_utils.py
+│       └── __pycache__
+│           └── file_utils.cpython-312.pyc
+├── docker-compose.yml
+├── Dockerfile
+├── README.md
+├── requirements.txt
