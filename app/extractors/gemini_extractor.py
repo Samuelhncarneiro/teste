@@ -15,7 +15,6 @@ from app.extractors.extraction_agent import ExtractionAgent
 from app.extractors.color_mapping_agent import ColorMappingAgent
 from app.extractors.layout_detetion_agent import LayoutDetetionAgent
 from app.extractors.generic_strategy_agent import GenericStrategyAgent
-from app.extractors.universal_ai_system import UniversalAnalyzer
 
 from app.utils.file_utils import convert_pdf_to_images
 from app.utils.barcode_generator import add_barcodes_to_extraction_result, add_barcodes_to_products
@@ -41,9 +40,6 @@ class GeminiExtractor(BaseExtractor):
         
         self.layout_detector = LayoutDetetionAgent(api_key)
         self.strategy_agent = GenericStrategyAgent()
-
-        self.universal_analyzer = UniversalAnalyzer()
-        self.use_universal = True
 
         self.current_layout_analysis = {}
         self.current_strategy = None
@@ -228,7 +224,8 @@ class GeminiExtractor(BaseExtractor):
         start_time = time.time()
         
         try:
-
+            logger.info(f"🚀 INICIANDO EXTRAÇÃO - Job: {job_id}")  # ADICIONAR
+            
             jobs_store[job_id]["model_results"]["gemini"] = {
                 "model_name": GEMINI_MODEL,
                 "status": "processing",
@@ -239,33 +236,43 @@ class GeminiExtractor(BaseExtractor):
             is_pdf = document_path.lower().endswith('.pdf')
             
             if is_pdf:
+                logger.info(f"📄 Processando PDF: {document_path}")  # ADICIONAR
+                
                 jobs_store[job_id]["model_results"]["gemini"]["progress"] = 10.0
                 logger.info(f"=== ANÁLISE GENÉRICA INICIADA ===")
                 logger.info(f"Documento: {os.path.basename(document_path)}")
                 
                 # NOVA: Análise completa (contexto + layout + estratégia)
+                logger.info("🔍 Iniciando análise de contexto...")  # ADICIONAR
                 context_description = await self.analyze_context(document_path)
+                logger.info("✅ Análise de contexto concluída")  # ADICIONAR
+                
                 context_info = self.current_context_info
                 
                 logger.info(f"Análise completa concluída:")
                 logger.info(f"- Layout: {self.current_layout_analysis.get('layout_type', 'UNKNOWN')}")
                 logger.info(f"- Estratégia: {self.current_strategy.name if self.current_strategy else 'N/A'}")
             else:
+                logger.info("📄 Documento não é PDF, usando configuração básica")  # ADICIONAR
                 context_description = "Documento de pedido ou nota de encomenda"
                 context_info = {"document_type": "Documento de pedido", "supplier": "", "brand": ""}
             
             # ETAPA 2-4: Mantém-se igual (preparar imagens + extração + cores)
+            logger.info("🖼️ Preparando imagens...")  # ADICIONAR
             jobs_store[job_id]["model_results"]["gemini"]["progress"] = 15.0
             
             if is_pdf:
+                logger.info("📸 Convertendo PDF para imagens...")  # ADICIONAR
                 image_paths = convert_pdf_to_images(document_path, CONVERTED_DIR)
+                logger.info(f"✅ {len(image_paths)} imagens criadas")  # ADICIONAR
             else:
                 image_paths = [document_path]
                 
             total_pages = len(image_paths)
-            logger.info(f"Preparadas {total_pages} imagens para processamento")
+            logger.info(f"📋 Preparadas {total_pages} imagens para processamento")
             
             # Extração com adaptação automática
+            logger.info("🤖 Iniciando extração com IA...")  # ADICIONAR
             combined_result = {"products": [], "order_info": {}}
             
             if context_info:
@@ -282,10 +289,13 @@ class GeminiExtractor(BaseExtractor):
             progress_per_page = 80.0 / total_pages
             
             for page_num, img_path in enumerate(image_paths, start=1):
+                logger.info(f"📄 Processando página {page_num}/{total_pages}: {os.path.basename(img_path)}")  # ADICIONAR
+                
                 current_progress = 15.0 + (page_num - 1) * progress_per_page
                 jobs_store[job_id]["model_results"]["gemini"]["progress"] = current_progress
                 
                 # NOVA: Processamento com adaptação automática
+                logger.info(f"🔍 Enviando página {page_num} para análise IA...")  # ADICIONAR
                 page_result = await self.process_page(
                     img_path,
                     context_description,
@@ -293,16 +303,19 @@ class GeminiExtractor(BaseExtractor):
                     total_pages,
                     combined_result if page_num > 1 else None
                 )
+                logger.info(f"✅ Página {page_num} processada")  # ADICIONAR
                 
                 # Verificar erro (mantém-se igual)
                 if "error" in page_result and not page_result.get("products"):
-                    logger.error(f"Erro ao processar página {page_num}: {page_result['error']}")
+                    logger.error(f"❌ Erro ao processar página {page_num}: {page_result['error']}")
                     if page_num == 1:
                         raise ValueError(f"Falha ao processar a primeira página: {page_result['error']}")
                     continue
                 
                 # Mesclar resultados (mantém-se igual)
                 if "products" in page_result:
+                    products_found = len(page_result.get("products", []))
+                    logger.info(f"📦 Página {page_num}: {products_found} produtos encontrados")  # ADICIONAR
                     combined_result["products"].extend(page_result.get("products", []))
                 
                 if "order_info" in page_result and page_result["order_info"]:
@@ -312,7 +325,9 @@ class GeminiExtractor(BaseExtractor):
                 
                 jobs_store[job_id]["model_results"]["gemini"]["progress"] = 15.0 + page_num * progress_per_page
             
-            # Mapeamento de cores (mantém-se igual)
+            total_products = len(combined_result["products"])
+            logger.info(f"🎉 EXTRAÇÃO CONCLUÍDA - Total de produtos: {total_products}")
+            
             if combined_result["products"]:
                 try:
                     mapped_products = self.ai_color_mapping_agent.map_product_colors(
@@ -417,6 +432,10 @@ class GeminiExtractor(BaseExtractor):
             
             update_progress_callback(job_id)
             
+            rocessing_time = time.time() - start_time
+            logger.info(f"⏱️ Tempo total de processamento: {processing_time:.2f}s")  
+            logger.info(f"📊 Taxa de produtos por segundo: {total_products/processing_time:.2f}")
+
             return combined_result
                 
         except Exception as e:
