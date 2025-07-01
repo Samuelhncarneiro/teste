@@ -31,6 +31,9 @@ RESULTS_RETENTION_HOURS = int(os.getenv("RESULTS_RETENTION_HOURS", "72"))
 LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 LOG_LEVEL = "INFO"
 
+ENABLE_UNIVERSAL_AI = True 
+UNIVERSAL_CONFIDENCE_THRESHOLD = 0.5
+
 # Criar diretórios necessários
 for dir_path in [TEMP_DIR, RESULTS_DIR, CONVERTED_DIR]:
     os.makedirs(dir_path, exist_ok=True)

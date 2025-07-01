@@ -101,7 +101,7 @@ class ExtractionAgent:
         
         {context}
         
-         ## REGRAS CRÍTICAS PARA TAMANHOS:
+        ## REGRAS CRÍTICAS PARA TAMANHOS:
     
         **MAPEAMENTO POSICIONAL**: Quando vir tamanhos em uma linha e quantidades em outra:
         
@@ -124,7 +124,7 @@ class ExtractionAgent:
         
         Para cada produto, extraia:
         - Nome do produto
-        - Código do material (ex:`CF5015E0624`,`50469055`,`23411201`,`T3216`)
+        - Código do material (ex:`CF5015E0624`,`50469055`,`23411201`)
         - Categoria do produto - DEVE ser traduzido para PORTUGUÊS, usando APENAS uma das seguintes categorias: {CATEGORIES}
         - Modelo
         - Composição (se disponível) - Deve ser traduzido para Português - Portugal
@@ -177,12 +177,30 @@ class ExtractionAgent:
         ## Progresso da Extração
         Já extraímos {previous_products_count} produtos das páginas anteriores.
         
+        ## REGRAS CRÍTICAS PARA TAMANHOS:
+    
+        **MAPEAMENTO POSICIONAL**: Quando vir tamanhos em uma linha e quantidades em outra:
+        
+        EXEMPLO:
+        ```
+        XS   S    M    L    XL   XXL
+            1    1    1
+        ```
+        ➜ INTERPRETAR: S=1, M=1, L=1 (XS, XL, XXL = SEM quantidade = NÃO incluir)
+        
+        **ALGORITMO**:
+        1. Identificar linha com tamanhos
+        2. Localizar linha com quantidades (normalmente seguinte)
+        3. Mapear por posição: quantidade corresponde ao tamanho na mesma coluna
+        4. Incluir APENAS tamanhos que têm quantidade > 0
+        5. Ignorar células vazias ou quantidades zero
+        
         ## Tarefa de Extração
         Analise APENAS esta página atual e extraia produtos ADICIONAIS que não foram extraídos anteriormente.
         
         Para cada produto, extraia:
         - Nome do produto
-        - Código do material(ex:`CF5015E0624`,`50469055`,`23411201`,`T3216`)
+        - Código do material(ex:`CF5015E0624`,`50469055`,`23411201`)
         - Categoria do produto - DEVE ser em PORTUGUÊS, usando APENAS uma das seguintes categorias: {CATEGORIES}
         - Modelo
         - Composição (se disponível) - Deve ser traduzido para Português - Portugal
@@ -314,6 +332,11 @@ class ExtractionAgent:
                     if field not in product:
                         product[field] = None if field != "colors" else []
                 
+                if product.get("name") is None:
+                    product["name"] = ""
+                if product.get("material_code") is None:
+                    product["material_code"] = ""
+
                 # Limpar as cores
                 if isinstance(product["colors"], list):
                     clean_colors = []

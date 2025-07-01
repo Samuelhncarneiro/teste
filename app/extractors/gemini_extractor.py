@@ -15,6 +15,7 @@ from app.extractors.extraction_agent import ExtractionAgent
 from app.extractors.color_mapping_agent import ColorMappingAgent
 from app.extractors.layout_detetion_agent import LayoutDetetionAgent
 from app.extractors.generic_strategy_agent import GenericStrategyAgent
+from app.extractors.universal_ai_system import UniversalAnalyzer
 
 from app.utils.file_utils import convert_pdf_to_images
 from app.utils.barcode_generator import add_barcodes_to_extraction_result, add_barcodes_to_products
@@ -41,11 +42,32 @@ class GeminiExtractor(BaseExtractor):
         self.layout_detector = LayoutDetetionAgent(api_key)
         self.strategy_agent = GenericStrategyAgent()
 
+        self.universal_analyzer = UniversalAnalyzer()
+        self.use_universal = True
+
         self.current_layout_analysis = {}
         self.current_strategy = None
         self.page_results_history = []
 
     async def analyze_context(self, document_path: str) -> str:
+        if self.use_universal:
+            try:
+                logger.info("Tentando análise universal...")
+                universal_result = self.universal_analyzer.analyze_document(document_path)
+                
+                if universal_result.get("use_universal", False):
+                    logger.info("Usando sistema universal")
+                    self.current_universal_analysis = universal_result
+                    return universal_result["adaptive_prompt"]
+                else:
+                    logger.info("Sistema universal não confiante, usando clássico")
+                    
+            except Exception as e:
+                logger.error(f"Erro no sistema universal: {e}")
+                logger.info("Fallback para sistema clássico")
+        
+        logger.info("🔧 Usando análise clássica")
+        
         context_info = await self.context_agent.analyze_document(document_path)
         
         logger.info("Detectando layout do documento...")
@@ -435,6 +457,8 @@ class GeminiExtractor(BaseExtractor):
             
             # Limpeza do nome do produto
             product_name = product.get("name", "")
+            if product_name is None: 
+                product_name = ""
             pattern = r'^([A-Za-z\s]+)(?:\s+\d+.*)?$'
             match = re.match(pattern, product_name)
             

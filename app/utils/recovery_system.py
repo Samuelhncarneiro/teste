@@ -139,18 +139,11 @@ class ProcessingRecovery:
     
     @staticmethod
     def clean_product_name(name: str) -> str:
-        """
-        Remove números e códigos do nome do produto
-        
-        Args:
-            name: Nome original do produto
-            
-        Returns:
-            str: Nome limpo do produto
-        """
+        if name is None:
+            name = ""
         if not name:
             return ""
-            
+
         # Padrão para identificar nomes de produtos (ex: Paddy 10241663 01)
         pattern = r'^([A-Za-z\s]+)(?:\s+\d+.*)?$'
         match = re.match(pattern, name)
@@ -169,18 +162,6 @@ class ProcessingRecovery:
     
     @staticmethod
     def format_product_description(product_name: str, color_code: str, size: str) -> str:
-        """
-        Formata descrição padronizada para produtos
-        
-        Args:
-            product_name: Nome do produto
-            color_code: Código da cor
-            size: Tamanho
-            
-        Returns:
-            str: Descrição formatada
-        """
-        # Limpar nome do produto para garantir que está sem números
         clean_name = ProcessingRecovery.clean_product_name(product_name)
         
         # Formato padrão: Nome[COR/TAMANHO]
@@ -191,17 +172,6 @@ class ProcessingRecovery:
         extraction_result: Dict[str, Any], 
         supplier: str = ""
     ) -> Dict[str, Any]:
-        """
-        Corrige um resultado completo de extração para garantir que é válido
-        
-        Args:
-            extraction_result: Resultado da extração
-            supplier: Nome do fornecedor para cálculo de markup
-            
-        Returns:
-            Dict: Resultado corrigido
-        """
-        # Verificar se é um resultado válido
         if not extraction_result or not isinstance(extraction_result, dict):
             logger.warning("Resultado de extração inválido ou vazio")
             return {"products": [], "order_info": {}}
