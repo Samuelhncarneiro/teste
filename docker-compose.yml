@@ -14,8 +14,15 @@ services:
     environment:
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - LOG_LEVEL=INFO
+      - ENABLE_METRICS=true
       - CLEANUP_INTERVAL_HOURS=6
       - TEMP_RETENTION_HOURS=24
       - RESULTS_RETENTION_HOURS=72
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
     env_file:
       - .env

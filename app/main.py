@@ -2,68 +2,243 @@
 import os
 import json
 import logging
-import asyncio
 import time
 from typing import Optional, Dict, Any
-from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Depends
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, BackgroundTasks, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 import pandas as pd
 from datetime import datetime
 
-# Imports das melhorias
-from app.config.settings import config
-from app.utils.error_handler import error_handler, handle_exceptions, ErrorCode, ErrorSeverity
-from app.monitoring.metrics import metrics_collector, performance_monitor, health_checker
-from app.monitoring.health_check import health_checker
-from app.extractors.unified_extractor import UnifiedExtractor, ExtractionConfig, ExtractionStrategy
-
 # Imports originais mantidos
+from app.config import (
+    APP_TITLE, APP_DESCRIPTION, APP_VERSION, 
+    TEMP_DIR, RESULTS_DIR, CONVERTED_DIR, DATA_DIR,
+    CLEANUP_INTERVAL_HOURS, TEMP_RETENTION_HOURS, RESULTS_RETENTION_HOURS,
+    LOG_FORMAT, LOG_LEVEL
+)
+
 from app.models.schemas import JobStatus
 from app.services.job_service import JobService
 from app.services.cleanup_service import init_cleanup_service, get_cleanup_service
 from app.services.document_service import DocumentService
+from app.extractors.gemini_extractor import GeminiExtractor
 
-# Configurar logging baseado na configuração
-logging.basicConfig(
-    level=getattr(logging, config.logging.level), 
-    format=config.logging.format
-)
+# Sistema de métricas simples integrado
+class SimpleMetrics:
+    """Sistema de métricas simples integrado"""
+    
+    def __init__(self):
+        self.stats = {
+            "total_requests": 0,
+            "successful_requests": 0,
+            "failed_requests": 0,
+            "total_processing_time": 0.0,
+            "total_products_extracted": 0,
+            "active_jobs": 0,
+            "peak_active_jobs": 0,
+            "start_time": datetime.now()
+        }
+        self.recent_requests = []  # Para rate de sucesso recente
+    
+    def record_request_start(self, job_id: str):
+        """Registra início de processamento"""
+        self.stats["total_requests"] += 1
+        self.stats["active_jobs"] += 1
+        self.stats["peak_active_jobs"] = max(self.stats["peak_active_jobs"], self.stats["active_jobs"])
+        
+        # Manter apenas últimas 100 requests para rate recente
+        if len(self.recent_requests) > 100:
+            self.recent_requests.pop(0)
+    
+    def record_request_success(self, job_id: str, processing_time: float, products_count: int):
+        """Registra sucesso no processamento"""
+        self.stats["active_jobs"] -= 1
+        self.stats["successful_requests"] += 1
+        self.stats["total_processing_time"] += processing_time
+        self.stats["total_products_extracted"] += products_count
+        
+        self.recent_requests.append({"success": True, "time": datetime.now()})
+    
+    def record_request_failure(self, job_id: str, error_type: str = "unknown"):
+        """Registra falha no processamento"""
+        self.stats["active_jobs"] -= 1
+        self.stats["failed_requests"] += 1
+        
+        self.recent_requests.append({"success": False, "time": datetime.now()})
+    
+    def get_current_stats(self) -> Dict[str, Any]:
+        """Retorna estatísticas atuais"""
+        uptime = datetime.now() - self.stats["start_time"]
+        
+        # Calcular rate de sucesso recente (últimas 50 requests)
+        recent_50 = self.recent_requests[-50:] if len(self.recent_requests) >= 50 else self.recent_requests
+        recent_success_rate = sum(1 for r in recent_50 if r["success"]) / len(recent_50) if recent_50 else 1.0
+        
+        return {
+            "processing": {
+                "total_requests": self.stats["total_requests"],
+                "successful_requests": self.stats["successful_requests"],
+                "failed_requests": self.stats["failed_requests"],
+                "success_rate": self.stats["successful_requests"] / max(1, self.stats["total_requests"]),
+                "recent_success_rate": recent_success_rate,
+                "average_processing_time": self.stats["total_processing_time"] / max(1, self.stats["successful_requests"]),
+                "total_products_extracted": self.stats["total_products_extracted"]
+            },
+            "system": {
+                "active_jobs": self.stats["active_jobs"],
+                "peak_active_jobs": self.stats["peak_active_jobs"],
+                "uptime_seconds": int(uptime.total_seconds())
+            },
+            "timestamp": datetime.now().isoformat()
+        }
+
+# Sistema de health check simples
+class SimpleHealthChecker:
+    """Health checker simples integrado"""
+    
+    def __init__(self, metrics: SimpleMetrics):
+        self.metrics = metrics
+    
+    def check_health(self) -> Dict[str, Any]:
+        """Verifica saúde geral do sistema"""
+        stats = self.metrics.get_current_stats()
+        
+        health_data = {
+            "status": "healthy",
+            "timestamp": datetime.now().isoformat(),
+            "checks": {}
+        }
+        
+        # Check de sistema
+        system_check = self._check_system()
+        health_data["checks"]["system"] = system_check
+        
+        # Check de performance
+        performance_check = self._check_performance(stats)
+        health_data["checks"]["performance"] = performance_check
+        
+        # Check de configuração
+        config_check = self._check_configuration()
+        health_data["checks"]["configuration"] = config_check
+        
+        # Determinar status geral
+        all_checks = [system_check, performance_check, config_check]
+        if any(check["status"] == "critical" for check in all_checks):
+            health_data["status"] = "critical"
+        elif any(check["status"] == "warning" for check in all_checks):
+            health_data["status"] = "warning"
+        
+        return health_data
+    
+    def _check_system(self) -> Dict[str, Any]:
+        """Verifica recursos do sistema"""
+        try:
+            import psutil
+            
+            memory = psutil.virtual_memory()
+            disk = psutil.disk_usage('/')
+            
+            status = "healthy"
+            issues = []
+            
+            if memory.percent > 90:
+                status = "critical"
+                issues.append("Memória crítica")
+            elif memory.percent > 80:
+                status = "warning"
+                issues.append("Memória alta")
+            
+            disk_percent = (disk.used / disk.total) * 100
+            if disk_percent > 95:
+                status = "critical"
+                issues.append("Disco crítico")
+            elif disk_percent > 90:
+                status = "warning"
+                issues.append("Disco cheio")
+            
+            return {
+                "status": status,
+                "memory_percent": memory.percent,
+                "disk_percent": round(disk_percent, 2),
+                "issues": issues
+            }
+        except ImportError:
+            return {
+                "status": "warning",
+                "message": "psutil não disponível para monitoramento de sistema"
+            }
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+    
+    def _check_performance(self, stats: Dict[str, Any]) -> Dict[str, Any]:
+        """Verifica performance do sistema"""
+        processing_stats = stats["processing"]
+        
+        success_rate = processing_stats["success_rate"]
+        recent_success_rate = processing_stats["recent_success_rate"]
+        avg_time = processing_stats["average_processing_time"]
+        
+        status = "healthy"
+        issues = []
+        
+        if recent_success_rate < 0.5:
+            status = "critical"
+            issues.append("Taxa de sucesso recente muito baixa")
+        elif recent_success_rate < 0.8:
+            status = "warning"
+            issues.append("Taxa de sucesso recente baixa")
+        
+        if avg_time > 300:  # 5 minutos
+            status = "warning"
+            issues.append("Tempo de processamento alto")
+        
+        return {
+            "status": status,
+            "success_rate": success_rate,
+            "recent_success_rate": recent_success_rate,
+            "average_processing_time": avg_time,
+            "issues": issues
+        }
+    
+    def _check_configuration(self) -> Dict[str, Any]:
+        """Verifica configuração do sistema"""
+        issues = []
+        
+        # Verificar API key
+        from app.config import GEMINI_API_KEY
+        if not GEMINI_API_KEY:
+            issues.append("API key do Gemini não configurada")
+        
+        # Verificar diretórios
+        required_dirs = [TEMP_DIR, RESULTS_DIR, CONVERTED_DIR]
+        for directory in required_dirs:
+            if not os.path.exists(directory):
+                issues.append(f"Diretório não existe: {directory}")
+        
+        status = "critical" if issues else "healthy"
+        
+        return {
+            "status": status,
+            "issues": issues
+        }
+
+# Inicializar sistemas
+logging.basicConfig(level=getattr(logging, LOG_LEVEL), format=LOG_FORMAT)
 logger = logging.getLogger(__name__)
 
-# Callback para monitoramento de erros
-def error_callback(error_info):
-    """Callback para tratamento de erros"""
-    metrics_collector.record_request_failure("unknown", error_info.code.value)
-    
-    # Aqui você pode adicionar integração com sistemas de alertas
-    if error_info.severity in [ErrorSeverity.HIGH, ErrorSeverity.CRITICAL]:
-        logger.critical(f"Erro crítico detectado: {error_info.code.value} - {error_info.message}")
+# Inicializar métricas e health check
+metrics = SimpleMetrics()
+health_checker = SimpleHealthChecker(metrics)
 
-error_handler.add_callback(error_callback)
-
-# Inicializar serviços
+# Inicializar serviços originais
 job_service = JobService()
-
-# Configurar extrator unificado
-extraction_config = ExtractionConfig(
-    strategy=ExtractionStrategy.AUTO,
-    enable_color_mapping=config.extractor.enable_color_mapping,
-    enable_barcode_generation=config.extractor.enable_barcode_generation,
-    enable_supplier_detection=config.extractor.enable_supplier_detection,
-    max_retries=config.extractor.max_retries,
-    timeout_seconds=config.extractor.timeout_seconds,
-    confidence_threshold=config.extractor.confidence_threshold
-)
-
-unified_extractor = UnifiedExtractor(extraction_config)
 document_service = DocumentService(job_service)
 
-# Inicializar FastAPI
 app = FastAPI(
-    title="Extrator de Documentos Avançado",
-    description="API otimizada para extrair informações de documentos usando IA",
-    version="2.0.0",
+    title=APP_TITLE,
+    description=APP_DESCRIPTION,
+    version=APP_VERSION,
     docs_url="/docs",
     redoc_url="/redoc"
 )
@@ -84,56 +259,59 @@ async def metrics_middleware(request, call_next):
     
     response = await call_next(request)
     
-    # Registrar métricas
+    # Log simples de métricas
     processing_time = time.time() - start_time
-    metrics_collector.record_api_call(
-        provider="internal",
-        duration=processing_time,
-        success=response.status_code < 400
-    )
+    if processing_time > 1.0:  # Log apenas requests lentos
+        logger.info(f"Slow request: {request.url.path} took {processing_time:.2f}s")
     
     return response
 
-def get_unified_extractor():
-    """Dependência para obter o extrator unificado"""
-    return unified_extractor
+def get_gemini_extractor():
+    """Dependência para obter o extrator Gemini"""
+    return GeminiExtractor()
 
 @app.on_event("startup")
 async def startup_event():
-    """Evento executado na inicialização do aplicativo"""
-    logger.info("Aplicação a iniciar...")
+    logger.info("🚀 Aplicação a iniciar...")
     
     # Verificar saúde inicial
     health = health_checker.check_health()
     if health["status"] == "critical":
-        logger.error("Sistema em estado crítico:")
+        logger.error("❌ Sistema em estado crítico:")
         for check_name, check_data in health["checks"].items():
             if check_data["status"] == "critical":
-                logger.error(f"  - {check_name}: {check_data}")
-        raise RuntimeError("Sistema não pode iniciar em estado crítico")
+                logger.error(f"  - {check_name}: {check_data.get('issues', [])}")
+        # Não falhar completamente, apenas avisar
+        logger.warning("⚠️ Sistema iniciando mesmo com problemas críticos")
+    
+    # Verificar diretórios necessários
+    for dir_path in [TEMP_DIR, RESULTS_DIR, CONVERTED_DIR]:
+        if not os.path.exists(dir_path):
+            os.makedirs(dir_path)
+            logger.info(f"📁 Diretório criado: {dir_path}")
     
     # Inicializar serviço de limpeza
     cleanup_config = {
         "temp_dirs": [
-            {"path": config.storage.temp_dir, "retention_hours": config.storage.temp_retention_hours},
-            {"path": config.storage.converted_dir, "retention_hours": config.storage.results_retention_hours},
-            {"path": config.storage.results_dir, "retention_hours": config.storage.results_retention_hours},
+            {"path": TEMP_DIR, "retention_hours": TEMP_RETENTION_HOURS},
+            {"path": CONVERTED_DIR, "retention_hours": RESULTS_RETENTION_HOURS},
+            {"path": RESULTS_DIR, "retention_hours": RESULTS_RETENTION_HOURS},
         ],
-        "cleanup_interval_hours": config.storage.cleanup_interval_hours,
-        "retention_hours": config.storage.results_retention_hours
+        "cleanup_interval_hours": CLEANUP_INTERVAL_HOURS,
+        "retention_hours": RESULTS_RETENTION_HOURS
     }
     
     cleanup_service = init_cleanup_service(cleanup_config)
     if not cleanup_service.running:
         cleanup_service.start()
-        logger.info(f"🧹 Serviço de limpeza automática iniciado (intervalo: {config.storage.cleanup_interval_hours}h)")
+        logger.info(f"🧹 Serviço de limpeza automática iniciado (intervalo: {CLEANUP_INTERVAL_HOURS}h)")
     
-    logger.info("Aplicação iniciada com sucesso!")
+    logger.info("✅ Aplicação iniciada com sucesso!")
 
 @app.get("/health", summary="Verificar saúde do sistema")
 async def health_check():
     """
-    Endpoint de verificação de saúde do sistema.
+    🔍 Endpoint de verificação de saúde do sistema.
     Retorna informações detalhadas sobre o estado dos componentes.
     """
     health_data = health_checker.check_health()
@@ -147,51 +325,47 @@ async def health_check():
     return JSONResponse(content=health_data, status_code=status_code)
 
 @app.get("/metrics", summary="Obter métricas do sistema")
-async def get_metrics(hours: int = 1):
+async def get_metrics():
     """
-    Retorna métricas do sistema das últimas N horas.
-    
-    - **hours**: Número de horas para análise (padrão: 1)
+    📊 Retorna métricas do sistema.
     """
     try:
-        current_stats = metrics_collector.get_current_stats()
-        metrics_summary = metrics_collector.get_metrics_summary(hours)
-        
+        current_stats = metrics.get_current_stats()
         return {
             "current": current_stats,
-            "summary": metrics_summary,
-            "period_hours": hours
+            "description": "Métricas básicas do sistema de extração"
         }
     except Exception as e:
-        error_info = error_handler.handle_error(
-            e, ErrorCode.CONFIGURATION_ERROR, ErrorSeverity.MEDIUM
+        logger.error(f"Erro ao obter métricas: {str(e)}")
+        return JSONResponse(
+            content={"error": "Erro ao obter métricas", "detail": str(e)},
+            status_code=500
         )
-        return error_handler.create_response(error_info)
 
 @app.post("/process", response_model=JobStatus, summary="Processar documento")
-@performance_monitor("document_processing")
 async def process_document(
     file: UploadFile = File(...),
-    strategy: Optional[str] = None,
     background_tasks: BackgroundTasks = None,
-    extractor: UnifiedExtractor = Depends(get_unified_extractor)
+    gemini_extractor: GeminiExtractor = Depends(get_gemini_extractor)
 ):
     """
-    Processa um documento e extrai informações de produtos.
+    📄 Processa um documento e extrai informações de produtos.
     
     - **file**: Arquivo PDF para processamento
-    - **strategy**: Estratégia de extração (auto, tabular, sequential, hybrid)
     
     Retorna o status inicial do job.
     """
     
-    # Registrar início do processamento
+    # Gerar job_id
     job_id = os.path.basename(file.filename).split('.')[0]
-    metrics_collector.record_request_start(job_id)
+    
+    # Registrar início do processamento
+    metrics.record_request_start(job_id)
     
     try:
-        # Validações de entrada
+        # Validações básicas
         if not file.filename.lower().endswith('.pdf'):
+            metrics.record_request_failure(job_id, "invalid_format")
             raise HTTPException(
                 status_code=400, 
                 detail="Apenas arquivos PDF são suportados"
@@ -201,38 +375,25 @@ async def process_document(
         file_content = await file.read()
         file_size_mb = len(file_content) / (1024 * 1024)
         
-        if file_size_mb > config.storage.max_file_size_mb:
+        max_size_mb = 50  # Limite configurável
+        if file_size_mb > max_size_mb:
+            metrics.record_request_failure(job_id, "file_too_large")
             raise HTTPException(
                 status_code=413,
-                detail=f"Arquivo muito grande. Máximo: {config.storage.max_file_size_mb}MB"
+                detail=f"Arquivo muito grande. Máximo: {max_size_mb}MB"
             )
         
-        # Registrar métricas do arquivo
-        metrics_collector.record_file_processing(file_size_mb, "pdf")
-        
         # Salvar arquivo
-        file_location = os.path.join(
-            config.get_full_path(config.storage.temp_dir), 
-            f"{job_id}_{file.filename}"
-        )
+        file_location = os.path.join(TEMP_DIR, f"{job_id}_{file.filename}")
         
         with open(file_location, "wb") as file_object:
             file_object.write(file_content)
         
-        logger.info(f"Ficheiro salvo: {file_location} ({file_size_mb:.2f}MB)")
-        
-        # Configurar estratégia se especificada
-        if strategy:
-            try:
-                extraction_strategy = ExtractionStrategy(strategy.lower())
-                extractor.config.strategy = extraction_strategy
-                logger.info(f"Estratégia definida: {strategy}")
-            except ValueError:
-                logger.warning(f"Estratégia inválida '{strategy}', usando AUTO")
+        logger.info(f"📄 Arquivo salvo: {file_location} ({file_size_mb:.2f}MB)")
         
         # Processar documento
         job_id = await document_service.process_document(
-            file_location, file.filename, extractor, job_id
+            file_location, file.filename, gemini_extractor, job_id
         )
         
         # Retornar status inicial
@@ -241,30 +402,25 @@ async def process_document(
     
     except HTTPException:
         # Re-raise HTTP exceptions
-        metrics_collector.record_request_failure(job_id, "validation_error")
         raise
     except Exception as e:
         # Tratar outros erros
-        error_info = error_handler.handle_error(
-            e, ErrorCode.EXTRACTION_FAILED, ErrorSeverity.HIGH,
-            context={"job_id": job_id, "filename": file.filename}
-        )
-        metrics_collector.record_request_failure(job_id, error_info.code.value)
+        logger.exception(f"Erro ao processar documento: {str(e)}")
+        metrics.record_request_failure(job_id, "processing_error")
         
         raise HTTPException(
             status_code=500, 
-            detail=error_info.message
+            detail=f"Erro no processamento: {str(e)}"
         )
 
 @app.get("/job/{job_id}", response_model=JobStatus)
-@handle_exceptions(ErrorCode.EXTRACTION_FAILED, ErrorSeverity.LOW)
 async def get_job_status(job_id: str):
     """
-    Retorna o status de um job de processamento.
+    🔍 Retorna o status de um job de processamento.
     
     - **job_id**: ID do job
     """
-    logger.info(f"Status do job: {job_id}")
+    logger.info(f"🔍 Consultando status do job: {job_id}")
     
     job = job_service.get_job(job_id)
     if not job:
@@ -281,20 +437,16 @@ async def get_job_status(job_id: str):
             products_count = len(result.get("products", []))
             processing_time = job["model_results"]["gemini"].get("processing_time", 0)
             
-            # Estimar páginas processadas (pode ser melhorado)
-            pages_count = result.get("_metadata", {}).get("pages_processed", 1)
-            
-            metrics_collector.record_request_success(
-                job_id, processing_time, products_count, pages_count
-            )
+            metrics.record_request_success(job_id, processing_time, products_count)
+    elif job["status"] == "failed":
+        metrics.record_request_failure(job_id, "job_failed")
     
     return JobStatus(**job)
 
 @app.get("/job/{job_id}/excel", summary="Obter resultado em Excel")
-@handle_exceptions(ErrorCode.EXTRACTION_FAILED, ErrorSeverity.MEDIUM)
 async def get_job_excel(job_id: str, season: str = None):
     """
-    Retorna os resultados do job em formato Excel.
+    📊 Retorna os resultados do job em formato Excel.
     
     - **job_id**: ID do job
     - **season**: Temporada (opcional, ex: "FW23")
@@ -318,14 +470,11 @@ async def get_job_excel(job_id: str, season: str = None):
         df = create_dataframe_from_extraction(extraction_result, season)
         
         # Gerar arquivo Excel
-        excel_path = os.path.join(
-            config.get_full_path(config.storage.results_dir), 
-            f"{job_id}_result.xlsx"
-        )
+        excel_path = os.path.join(RESULTS_DIR, f"{job_id}_result.xlsx")
         
         if not os.path.exists(excel_path):
             df.to_excel(excel_path, index=False)
-            logger.info(f"Arquivo Excel gerado: {excel_path}")
+            logger.info(f"📊 Arquivo Excel gerado: {excel_path}")
         
         return FileResponse(
             path=excel_path,
@@ -333,16 +482,13 @@ async def get_job_excel(job_id: str, season: str = None):
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
     except Exception as e:
-        error_info = error_handler.handle_error(
-            e, ErrorCode.STORAGE_ERROR, ErrorSeverity.MEDIUM
-        )
-        raise HTTPException(status_code=500, detail=error_info.message)
+        logger.exception(f"Erro ao gerar Excel: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Erro ao gerar Excel: {str(e)}")
 
 @app.get("/job/{job_id}/json", summary="Obter resultado em JSON")
-@handle_exceptions(ErrorCode.EXTRACTION_FAILED, ErrorSeverity.MEDIUM)
 async def get_job_json(job_id: str):
     """
-    Retorna os resultados do job em formato JSON.
+    📋 Retorna os resultados do job em formato JSON.
     
     - **job_id**: ID do job
     """
@@ -362,49 +508,37 @@ async def get_job_json(job_id: str):
 @app.get("/jobs", summary="Listar todos os jobs")
 async def list_jobs():
     """
-    Lista todos os jobs ativos no sistema.
+    📋 Lista todos os jobs ativos no sistema.
     """
     return job_service.list_jobs()
-
-@app.get("/config", summary="Obter configurações")
-async def get_config():
-    """
-    Retorna as configurações atuais do sistema (sem dados sensíveis).
-    """
-    return config.to_dict()
-
-@app.post("/config/reload", summary="Recarregar configurações")
-async def reload_config():
-    """
-    Recarrega as configurações do sistema.
-    """
-    try:
-        config.reload()
-        logger.info("🔄 Configurações recarregadas")
-        return {"message": "Configurações recarregadas com sucesso"}
-    except Exception as e:
-        error_info = error_handler.handle_error(
-            e, ErrorCode.CONFIGURATION_ERROR, ErrorSeverity.MEDIUM
-        )
-        raise HTTPException(status_code=500, detail=error_info.message)
 
 @app.get("/", summary="Status da API")
 async def root():
     """
-    Verifica se a API está funcionando e retorna informações básicas.
+    🏠 Verifica se a API está funcionando e retorna informações básicas.
     """
-    stats = metrics_collector.get_current_stats()
-    
-    return {
-        "message": "API de Extração de Documentos v2.0",
-        "status": "online",
-        "version": "2.0.0",
-        "swagger_ui": "/docs",
-        "health_check": "/health",
-        "metrics": "/metrics",
-        "stats": stats["processing"],
-        "timestamp": datetime.now().isoformat()
-    }
+    try:
+        stats = metrics.get_current_stats()
+        
+        return {
+            "message": "API de Extração de Documentos com Melhorias",
+            "status": "online",
+            "version": APP_VERSION,
+            "swagger_ui": "/docs",
+            "health_check": "/health",
+            "metrics": "/metrics",
+            "stats": stats["processing"],
+            "uptime_seconds": stats["system"]["uptime_seconds"],
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Erro no endpoint root: {str(e)}")
+        return {
+            "message": "API de Extração de Documentos",
+            "status": "online",
+            "version": APP_VERSION,
+            "error": "Erro ao obter estatísticas"
+        }
 
 def create_dataframe_from_extraction(
     extraction_result: Dict[str, Any], 
@@ -412,7 +546,7 @@ def create_dataframe_from_extraction(
 ) -> pd.DataFrame:
     """
     Cria um DataFrame pandas a partir dos resultados da extração.
-    Versão otimizada com tratamento de erros melhorado.
+    Versão melhorada com tratamento de erros robusto.
     """
     try:
         data = []
@@ -484,15 +618,16 @@ def create_dataframe_from_extraction(
             df = pd.DataFrame(data)
             
             # Substituir valores NaN por valores padrão
-            df = df.fillna({
-                "Unit Price": 0.0,
-                "Sales Price": 0.0,
-                "Quantity": 0,
-                "Color Code": "",
-                "Color Name": "",
-                "Size": "",
-                "Category": "ACESSÓRIOS"
-            })
+            numeric_columns = ["Unit Price", "Sales Price", "Quantity"]
+            for col in numeric_columns:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+            
+            # Substituir strings vazias
+            string_columns = ["Color Code", "Color Name", "Size", "Category"]
+            for col in string_columns:
+                if col in df.columns:
+                    df[col] = df[col].fillna("")
             
             return df
         else:
@@ -513,19 +648,21 @@ if __name__ == "__main__":
     import uvicorn
     
     print("\n" + "="*60)
-    print("🚀 Iniciando Extrator de Documentos v2.0")
+    print("🚀 Iniciando Extrator de Documentos (Versão Melhorada)")
     print("="*60)
     print(f"📋 Swagger UI: http://localhost:8000/docs")
     print(f"❤️  Health Check: http://localhost:8000/health")
     print(f"📊 Métricas: http://localhost:8000/metrics")
-    print(f"📁 Uploads: {config.get_full_path(config.storage.temp_dir)}")
-    print(f"📁 Resultados: {config.get_full_path(config.storage.results_dir)}")
+    print(f"📁 Uploads: {TEMP_DIR}")
+    print(f"📁 Resultados: {RESULTS_DIR}")
+    print("\n💡 Pressione Ctrl+C para encerrar")
     print("="*60 + "\n")
     
+    # Iniciar servidor
     uvicorn.run(
         "app.main:app", 
         host="0.0.0.0", 
         port=8000, 
         reload=True,
-        log_level=config.logging.level.lower()
+        log_level=LOG_LEVEL.lower()
     )
