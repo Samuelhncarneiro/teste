@@ -46,22 +46,6 @@ class GeminiExtractor(BaseExtractor):
         self.page_results_history = []
 
     async def analyze_context(self, document_path: str) -> str:
-        if self.use_universal:
-            try:
-                logger.info("Tentando análise universal...")
-                universal_result = self.universal_analyzer.analyze_document(document_path)
-                
-                if universal_result.get("use_universal", False):
-                    logger.info("Usando sistema universal")
-                    self.current_universal_analysis = universal_result
-                    return universal_result["adaptive_prompt"]
-                else:
-                    logger.info("Sistema universal não confiante, usando clássico")
-                    
-            except Exception as e:
-                logger.error(f"Erro no sistema universal: {e}")
-                logger.info("Fallback para sistema clássico")
-        
         logger.info("🔧 Usando análise clássica")
         
         context_info = await self.context_agent.analyze_document(document_path)

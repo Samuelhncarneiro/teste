@@ -16,34 +16,12 @@ from app.utils.supplier_utils import match_supplier_name, normalize_supplier_nam
 logger = logging.getLogger(__name__)
 
 class ContextAgent:
-    """
-    Agente avançado para análise de contexto que identifica layout, fornecedor, 
-    marca e metadados do documento, incluindo informações sobre a localização
-    e estrutura dos produtos para auxiliar o agente de extração.
-    """
-    
     def __init__(self, api_key: str = GEMINI_API_KEY):
-        """
-        Inicializa o agente de contexto avançado
-        
-        Args:
-            api_key: Chave de API do Gemini (default: valor do .env)
-        """
         self.api_key = api_key
         genai.configure(api_key=self.api_key)
         self.model = genai.GenerativeModel(GEMINI_MODEL)
     
-    async def analyze_document(self, document_path: str) -> Dict[str, Any]:
-        """
-        Analisa o documento completo para extrair contexto e informações sobre layout
-        
-        Args:
-            document_path: Caminho para o documento
-            
-        Returns:
-            Dict: Informações contextuais e de layout do documento
-        """
-        # Extrair nome do arquivo para uso na análise
+    async def analyze_document(self, document_path: str) -> Dict[str, Any]:   
         filename = os.path.basename(document_path)
         fallback_info = {
             "document_type": "Documento de pedido",
@@ -514,7 +492,25 @@ class ContextAgent:
                         layout_info["special_instructions"] += ". A tabela tem muitas colunas, provavelmente para diferentes tamanhos."
         
         return layout_info
+
+    def _detect_product_code_patterns(self, text: str) -> Dict[str, Any]:
     
+        patterns = {
+            "cf_pattern": len(re.findall(r'\bCF\d+[A-Z]*\d*[A-Z]*\b', text)),
+            "alpha_numeric": len(re.findall(r'\b[A-Z]{2,}\d{4,}\b', text)),
+            "long_numeric": len(re.findall(r'\b\d{8,}\b', text)),
+            "short_alpha": len(re.findall(r'\b[A-Z]\d{3,}[A-Z]*\b', text)),
+        }
+        
+        # Determinar padrão mais comum
+        most_common = max(patterns.items(), key=lambda x: x[1])
+        
+        return {
+            "detected_patterns": patterns,
+            "primary_pattern": most_common[0] if most_common[1] > 0 else "unknown",
+            "total_codes_found": sum(patterns.values())
+        }
+
     def _ensure_supplier_and_brand(self, context_info: Dict[str, Any]) -> Dict[str, Any]:
         """
         Garante que as informações de fornecedor e marca estão presentes e consistentes.

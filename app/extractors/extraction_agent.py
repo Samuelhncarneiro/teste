@@ -89,10 +89,40 @@ class ExtractionAgent:
             logger.error(f"Erro ao processar página {page_number}: {str(e)}")
             return {"error": str(e), "products": []}
     
+    def _extract_headers_from_context(self, context: str) -> List[str]:
+        headers_match = re.search(r'Cabeçalhos Detectados: (.+)', context)
+        if headers_match:
+            headers_text = headers_match.group(1)
+            headers = re.findall(r'"([^"]+)"', headers_text)
+            return headers
+        return []
+
+    def _get_material_code_instructions(self, headers: List[str]) -> str:
+        headers_upper = [h.upper() for h in headers]
+        
+        if "MODEL" in headers_upper:
+            return "- Código do material: EXTRAIR da coluna 'Model'"
+        elif "REFERENCE" in headers_upper:
+            return "- Código do material: EXTRAIR da coluna 'Reference'"
+        elif "ARTICLE" in headers_upper:
+            return "- Código do material: EXTRAIR da coluna 'Article'"
+        elif "SKU" in headers_upper:
+            return "- Código do material: EXTRAIR da coluna 'SKU'"
+        elif "ITEM" in headers_upper:
+            return "- Código do material: EXTRAIR da coluna 'Item'"
+        else:
+            return """- Código do material: IDENTIFICAR por padrões alfanuméricos únicos no texto
+            - Procurar por códigos como: CF5015E0624, AB123456, 50469055, T3216
+            - Geralmente próximo ao nome do produto ou no início da linha"""
+            
     def _create_first_page_prompt(
         self, context: str, page_number: int, total_pages: int, json_template: str
     ) -> str:
 
+        headers_detected = self._extract_headers_from_context(context)
+        
+        material_code_instructions = self._get_material_code_instructions(headers_detected)
+    
         return f"""
         # INSTRUÇÕES PARA EXTRAÇÃO DE PRODUTOS
         
@@ -119,12 +149,17 @@ class ExtractionAgent:
         4. Incluir APENAS tamanhos que têm quantidade > 0
         5. Ignorar células vazias ou quantidades zero
 
+        ## PADRÕES COMUNS DE CÓDIGOS DE PRODUTOS:
+            - Alfanuméricos: CF5015E0624, AB123456, T3216
+            - Numéricos longos: 50469055, 23411201
+            - Híbridos: MA82O, MS55N, T054A
+
         ## Tarefa de Extração
         Analise esta página e extraia todas as informações de produtos presentes, seguindo todas as orientações de layout e estrutura descritas acima.
         
         Para cada produto, extraia:
         - Nome do produto
-        - Código do material (ex:`CF5015E0624`,`50469055`,`23411201`)
+        - **Código do material**: Identificar por padrões acima OU campo específico detectado        
         - Categoria do produto - DEVE ser traduzido para PORTUGUÊS, usando APENAS uma das seguintes categorias: {CATEGORIES}
         - Modelo
         - Composição (se disponível) - Deve ser traduzido para Português - Portugal
@@ -153,19 +188,11 @@ class ExtractionAgent:
     def _create_additional_page_prompt(
         self, context: str, page_number: int, total_pages: int, previous_products_count: int, json_template: str
     ) -> str:
-        """
-        Cria o prompt para páginas adicionais do documento
+
+        headers_detected = self._extract_headers_from_context(context)
         
-        Args:
-            context: Contexto formatado com informações do documento e layout
-            page_number: Número da página
-            total_pages: Total de páginas
-            previous_products_count: Número de produtos já encontrados
-            json_template: Template JSON de exemplo
-            
-        Returns:
-            str: Prompt completo
-        """
+        material_code_instructions = self._get_material_code_instructions(headers_detected)
+    
         return f"""
         # INSTRUÇÕES PARA EXTRAÇÃO DE PRODUTOS
         
@@ -173,9 +200,6 @@ class ExtractionAgent:
         Esta é a página {page_number} de {total_pages}.
         
         {context}
-        
-        ## Progresso da Extração
-        Já extraímos {previous_products_count} produtos das páginas anteriores.
         
         ## REGRAS CRÍTICAS PARA TAMANHOS:
     
@@ -194,14 +218,19 @@ class ExtractionAgent:
         3. Mapear por posição: quantidade corresponde ao tamanho na mesma coluna
         4. Incluir APENAS tamanhos que têm quantidade > 0
         5. Ignorar células vazias ou quantidades zero
-        
+
+        ## PADRÕES COMUNS DE CÓDIGOS DE PRODUTOS:
+            - Alfanuméricos: CF5015E0624, AB123456, T3216
+            - Numéricos longos: 50469055, 23411201
+            - Híbridos: MA82O, MS55N, T054A
+
         ## Tarefa de Extração
-        Analise APENAS esta página atual e extraia produtos ADICIONAIS que não foram extraídos anteriormente.
+        Analise esta página e extraia todas as informações de produtos presentes, seguindo todas as orientações de layout e estrutura descritas acima.
         
         Para cada produto, extraia:
         - Nome do produto
-        - Código do material(ex:`CF5015E0624`,`50469055`,`23411201`)
-        - Categoria do produto - DEVE ser em PORTUGUÊS, usando APENAS uma das seguintes categorias: {CATEGORIES}
+        - **Código do material**: Identificar por padrões acima OU campo específico detectado        
+        - Categoria do produto - DEVE ser traduzido para PORTUGUÊS, usando APENAS uma das seguintes categorias: {CATEGORIES}
         - Modelo
         - Composição (se disponível) - Deve ser traduzido para Português - Portugal
         - Para CADA COR do produto:
@@ -214,19 +243,16 @@ class ExtractionAgent:
 
         ## Regras Críticas:
         1. Extraia APENAS o que está visível nesta página específica
-        2. NÃO tente extrair produtos já processados das páginas anteriores
-        3. Inclua APENAS tamanhos com quantidades explicitamente indicadas
-        4. NÃO inclua tamanhos com células vazias ou quantidade zero
-        5. Utilize NULL para campos não encontrados, mas mantenha a estrutura JSON
-        6. Preste atenção especial a como as cores são organizadas conforme as instruções
-        7. IGNORE seções de resumo ou totais - extraia apenas produtos detalhados
+        2. Inclua APENAS tamanhos com quantidades explicitamente indicadas
+        3. NÃO inclua tamanhos com células vazias ou quantidade zero
+        4. Utilize NULL para campos não encontrados, mas mantenha a estrutura JSON
+        5. Preste atenção especial a como as cores são organizadas conforme as instruções
+        6. NÃO invente dados ou adicione produtos que não estão claramente na imagem
 
         ## Formato de Resposta
         Retorne os dados extraídos em formato JSON estrito:
         
         {json_template}
-        
-        Se também existirem informações adicionais sobre o pedido nesta página (como total geral, condições de pagamento, etc.), inclua-as no objeto order_info.
         """
     
     def _get_json_template(self) -> str:
@@ -235,7 +261,7 @@ class ExtractionAgent:
           "products": [
             {
               "name": "Nome do produto",
-              "material_code": "Código do material",
+              "material_code": "Código identificador único (OBRIGATÓRIO)",
               "category": "Categoria",
               "model": "Modelo",
               "composition": "100% algodão",
