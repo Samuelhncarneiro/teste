@@ -23,12 +23,11 @@ from app.utils.json_utils import safe_json_dump, fix_nan_in_products, sanitize_f
 from app.utils.supplier_assignment import determine_best_supplier, assign_supplier_to_products
 
 try:
-    from app.extractors.validation.universal_validation_agent import UniversalValidationAgent
-    from app.extractors.validation.data_verification_agent import DataVerificationAgent
-    VALIDATION_AVAILABLE = True
-except ImportError as e:
-    logger.warning(f"Agentes de validação não disponíveis: {str(e)}")
-    VALIDATION_AVAILABLE = False
+    from app.utils.json_utils import safe_json_dump, fix_nan_in_products, sanitize_for_json
+    has_json_utils = True
+except ImportError:
+    has_json_utils = False
+    logger.warning("Módulo json_utils não encontrado, usar serialização padrão")
 
 logger = logging.getLogger(__name__)
 
@@ -41,15 +40,6 @@ class GeminiExtractor(BaseExtractor):
         
         self.layout_detector = LayoutDetetionAgent(api_key)
         self.strategy_agent = GenericStrategyAgent()
-
-        if VALIDATION_AVAILABLE:
-            self.universal_validator = UniversalValidationAgent(api_key)
-            self.data_verifier = DataVerificationAgent(api_key)
-            logger.info("✅ Agentes de validação universal carregados")
-        else:
-            self.universal_validator = None
-            self.data_verifier = None
-            logger.warning("⚠️ Sistema funcionando sem validação universal")
 
         self.current_layout_analysis = {}
         self.current_strategy = None
@@ -170,7 +160,6 @@ class GeminiExtractor(BaseExtractor):
             image_path, context, page_number, total_pages, previous_result
         )
         
-        # NOVA: Armazenar resultado para adaptação
         page_result["_strategy_used"] = self.current_strategy.name if self.current_strategy else "unknown"
         self.page_results_history.append(page_result)
         

@@ -1,559 +1,635 @@
-# app/extractors/universal_validation_agent.py
+# app/extractors/validation/universal_validation_agent.py
+
 import logging
 import re
-import json
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Set, Tuple
 from dataclasses import dataclass
-from collections import Counter
-import google.generativeai as genai
-
-from app.config import GEMINI_API_KEY, GEMINI_MODEL
-from app.data.reference_data import CATEGORIES
+from enum import Enum
 
 logger = logging.getLogger(__name__)
 
-@dataclass
-class ValidationScore:
-    """Pontuação de validação para um produto"""
-    material_code_score: float = 0.0
-    category_score: float = 0.0
-    colors_score: float = 0.0
-    sizes_score: float = 0.0
-    prices_score: float = 0.0
-    overall_score: float = 0.0
-    details: Dict[str, Any] = None
+class ValidationSeverity(Enum):
+    """Níveis de severidade para problemas de validação"""
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
+    CRITICAL = "critical"
 
 @dataclass
-class ProductStats:
-    """Estatísticas de um produto"""
-    material_code: str
-    total_colors: int
-    total_sizes: int
-    total_quantity: int
-    price_range: Tuple[float, float]
-    size_distribution: Dict[str, int]
-    confidence_score: float
+class ValidationIssue:
+    """Representa um problema encontrado durante a validação"""
+    code: str
+    severity: ValidationSeverity
+    message: str
+    field_path: str
+    suggested_fix: Optional[str] = None
+    confidence: float = 1.0
 
 class UniversalValidationAgent:
     """
-    Agente universal de validação para qualquer tipo de nota de encomenda.
-    Calcula percentagens de acerto e valida dados automaticamente.
+    Agente de validação universal que verifica a qualidade e consistência
+    dos dados extraídos usando padrões genéricos da indústria.
     """
     
-    def __init__(self, api_key: str = GEMINI_API_KEY):
-        self.api_key = api_key
-        genai.configure(api_key=self.api_key)
-        self.model = genai.GenerativeModel(GEMINI_MODEL)
+    def __init__(self):
+        self.validation_rules = self._initialize_validation_rules()
+        self.price_ranges = self._initialize_price_ranges()
+        self.size_patterns = self._initialize_size_patterns()
+        self.color_patterns = self._initialize_color_patterns()
         
-        # Padrões universais para validação
-        self.material_code_patterns = {
-            'alphanumeric_long': r'^[A-Z]{2,6}\d{4,12}[A-Z]{0,6}$',  # CF5015E0624
-            'numeric_long': r'^\d{8,15}$',                           # 50243521
-            'mixed_format': r'^[A-Z0-9]{6,20}$',                    # Formato misto
-            'short_code': r'^[A-Z]{2,4}\d{2,6}$'                    # AB1234
-        }
-        
-        # Padrões de tamanhos universais
-        self.size_patterns = {
-            'letters': r'^(XXS|XS|S|M|L|XL|XXL|XXXL)$',
-            'numeric_clothing': r'^(3[4-9]|[4-5][0-9]|6[0-4])$',    # 34-64
-            'numeric_pants': r'^(2[4-9]|3[0-6])$',                  # 24-36
-            'numeric_shoes': r'^(3[5-9]|4[0-6])$',                  # 35-46
-            'mixed': r'^(X{0,3}[SML]{1,2}|[0-9]{2,3})$'
-        }
-        
-        # Padrões de cores
-        self.color_code_patterns = {
-            'numeric': r'^\d{3,8}$',
-            'alphanumeric': r'^[A-Z0-9]{3,8}$',
-            'hex_like': r'^[A-Fa-f0-9]{6}$'
-        }
-        
-        # Estatísticas globais
-        self.validation_stats = {
-            "total_products": 0,
-            "average_confidence": 0.0,
-            "products_by_confidence": {
-                "high": 0,    # >80%
-                "medium": 0,  # 50-80%
-                "low": 0      # <50%
+    def _initialize_validation_rules(self) -> Dict[str, Any]:
+        """Inicializa regras de validação genéricas"""
+        return {
+            "required_fields": {
+                "product": ["name", "material_code", "category"],
+                "color": ["color_code", "sizes"],
+                "size": ["size", "quantity"],
+                "order_info": ["supplier"]
             },
-            "common_issues": Counter(),
-            "material_code_stats": {},
-            "validation_details": []
+            "field_formats": {
+                "material_code": r"^[A-Z0-9]{3,20}$",
+                "color_code": r"^\d{3}$",
+                "quantity": r"^\d+$",
+                "unit_price": r"^\d+(\.\d{2})?$",
+                "sales_price": r"^\d+(\.\d{2})?$"
+            },
+            "business_rules": {
+                "max_products_per_document": 1000,
+                "max_colors_per_product": 50,
+                "max_sizes_per_color": 20,
+                "min_quantity": 1,
+                "max_quantity": 10000,
+                "min_price": 0.01,
+                "max_price": 10000.00
+            }
         }
     
-    async def validate_products_with_confidence(
-        self, 
-        products: List[Dict[str, Any]], 
-        original_images: List[str] = None
-    ) -> Dict[str, Any]:
+    def _initialize_price_ranges(self) -> Dict[str, float]:
         """
-        Valida produtos e calcula percentagens de confiança para cada um
+        Inicializa faixas de preços esperadas por categoria.
+        Valores em euros para validação de consistência.
+        """
+        # Mapeamento corrigido: cada categoria tem seu próprio valor
+        return {
+            'CAMISAS': 45.0,
+            'CASACOS': 120.0,
+            'VESTIDOS': 80.0,
+            'BLUSAS': 35.0,
+            'CALÇAS': 60.0,
+            'CALÇÃO': 25.0,
+            'MALHAS': 70.0,
+            'MAGLIA': 70.0,
+            'KNIT': 70.0,
+            'SWEATER': 70.0,
+            'SAIAS': 40.0,
+            'T-SHIRTS': 20.0,
+            'POLOS': 50.0,
+            'JEANS': 75.0,
+            'SWEATSHIRTS': 65.0,
+            'BLAZERS E FATOS': 150.0,
+            'BLUSÕES E PARKAS': 100.0,
+            'CALÇADO': 90.0,
+            'TOP': 30.0,
+            'ACESSÓRIOS': 25.0
+        }
+    
+    def _initialize_size_patterns(self) -> Dict[str, List[str]]:
+        """Inicializa padrões de tamanhos válidos por categoria"""
+        return {
+            "clothing_letters": ["XS", "S", "M", "L", "XL", "XXL", "XXXL"],
+            "clothing_numeric": ["34", "36", "38", "40", "42", "44", "46", "48", "50", "52", "54"],
+            "pants_numeric": ["24", "25", "26", "27", "28", "29", "30", "31", "32", "33", "34", "36"],
+            "shoes_numeric": ["35", "36", "37", "38", "39", "40", "41", "42", "43", "44", "45", "46"],
+            "children_numeric": ["2", "4", "6", "8", "10", "12", "14", "16"],
+            "universal": ["TU", "ONE SIZE", "ÚNICA"]
+        }
+    
+    def _initialize_color_patterns(self) -> Dict[str, str]:
+        """Inicializa padrões de validação para cores"""
+        return {
+            "numeric_code": r"^\d{3}$",
+            "alpha_code": r"^[A-Z]{2,4}$",
+            "alphanumeric_code": r"^[A-Z0-9]{2,5}$"
+        }
+    
+    def validate_extraction_result(self, extraction_result: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Valida um resultado completo de extração
         
+        Args:
+            extraction_result: Resultado da extração a ser validado
+            
         Returns:
-            Dict com produtos validados e relatório detalhado
+            Dict: Relatório de validação com problemas encontrados e métricas
         """
-        if not products:
-            return {"validated_products": [], "validation_report": {}}
+        issues = []
+        metrics = {
+            "total_products": 0,
+            "valid_products": 0,
+            "total_colors": 0,
+            "valid_colors": 0,
+            "total_sizes": 0,
+            "valid_sizes": 0,
+            "validation_score": 0.0
+        }
         
-        logger.info(f"🔍 Iniciando validação universal de {len(products)} produtos...")
-        
-        validated_products = []
-        product_scores = []
-        material_code_stats = {}
-        
-        for i, product in enumerate(products):
-            logger.debug(f"Validando produto {i+1}/{len(products)}")
+        try:
+            # Validar estrutura geral
+            issues.extend(self._validate_overall_structure(extraction_result))
             
-            # Calcular pontuação de confiança
-            validation_score = self._calculate_product_confidence(product, i+1)
+            # Validar order_info
+            if "order_info" in extraction_result:
+                issues.extend(self._validate_order_info(extraction_result["order_info"]))
             
-            # Gerar estatísticas do produto
-            product_stats = self._generate_product_stats(product)
+            # Validar produtos
+            if "products" in extraction_result:
+                product_issues, product_metrics = self._validate_products(extraction_result["products"])
+                issues.extend(product_issues)
+                metrics.update(product_metrics)
             
-            # Armazenar estatísticas por material code
-            if product_stats.material_code:
-                material_code_stats[product_stats.material_code] = {
-                    "colors_found": product_stats.total_colors,
-                    "sizes_found": product_stats.total_sizes,
-                    "total_quantity": product_stats.total_quantity,
-                    "confidence": product_stats.confidence_score,
-                    "size_distribution": product_stats.size_distribution,
-                    "price_range": product_stats.price_range
-                }
+            # Calcular score geral de validação
+            metrics["validation_score"] = self._calculate_validation_score(issues, metrics)
             
-            validated_product = product.copy()
-            validated_product["_validation"] = {
-                "confidence_score": validation_score.overall_score,
-                "confidence_percentage": f"{validation_score.overall_score:.1f}%",
-                "scores_breakdown": {
-                    "material_code": f"{validation_score.material_code_score:.1f}%",
-                    "category": f"{validation_score.category_score:.1f}%",
-                    "colors": f"{validation_score.colors_score:.1f}%",
-                    "sizes": f"{validation_score.sizes_score:.1f}%",
-                    "prices": f"{validation_score.prices_score:.1f}%"
-                },
-                "product_stats": {
-                    "total_colors": product_stats.total_colors,
-                    "total_sizes": product_stats.total_sizes,
-                    "total_quantity": product_stats.total_quantity,
-                    "size_distribution": product_stats.size_distribution
-                },
-                "issues_found": validation_score.details.get("issues", []),
-                "validation_level": self._get_confidence_level(validation_score.overall_score)
+            # Agrupar issues por severidade
+            issues_by_severity = self._group_issues_by_severity(issues)
+            
+            return {
+                "validation_status": "passed" if len([i for i in issues if i.severity in [ValidationSeverity.ERROR, ValidationSeverity.CRITICAL]]) == 0 else "failed",
+                "total_issues": len(issues),
+                "issues_by_severity": issues_by_severity,
+                "detailed_issues": [self._issue_to_dict(issue) for issue in issues],
+                "metrics": metrics,
+                "recommendations": self._generate_recommendations(issues, metrics)
             }
             
-            validated_products.append(validated_product)
-            product_scores.append(validation_score.overall_score)
-        
-        # Gerar relatório de validação
-        validation_report = self._generate_validation_report(
-            validated_products, product_scores, material_code_stats
-        )
-        
-        # Atualizar estatísticas globais
-        self.validation_stats["total_products"] = len(products)
-        self.validation_stats["average_confidence"] = sum(product_scores) / len(product_scores)
-        self.validation_stats["material_code_stats"] = material_code_stats
-        
-        # Log do relatório
-        self._log_validation_summary(validation_report)
-        
-        return {
-            "validated_products": validated_products,
-            "validation_report": validation_report
-        }
+        except Exception as e:
+            logger.exception(f"Erro durante validação: {str(e)}")
+            return {
+                "validation_status": "error",
+                "error": str(e),
+                "total_issues": 0,
+                "metrics": metrics
+            }
     
-    def _calculate_product_confidence(self, product: Dict[str, Any], product_number: int) -> ValidationScore:
-        """
-        Calcula pontuação de confiança detalhada para um produto
-        """
-        scores = ValidationScore()
+    def _validate_overall_structure(self, extraction_result: Dict[str, Any]) -> List[ValidationIssue]:
+        """Valida a estrutura geral do resultado"""
         issues = []
         
-        # 1. VALIDAÇÃO MATERIAL CODE (25%)
-        material_code = product.get("material_code", "").strip()
-        scores.material_code_score = self._validate_material_code_confidence(material_code)
+        # Verificar campos obrigatórios principais
+        required_top_level = ["products"]
+        for field in required_top_level:
+            if field not in extraction_result:
+                issues.append(ValidationIssue(
+                    code="MISSING_TOP_LEVEL_FIELD",
+                    severity=ValidationSeverity.CRITICAL,
+                    message=f"Campo obrigatório '{field}' não encontrado",
+                    field_path=field,
+                    suggested_fix=f"Adicionar campo '{field}' ao resultado"
+                ))
         
-        if scores.material_code_score < 50:
-            issues.append(f"Material code suspeito: '{material_code}'")
+        # Verificar se products é uma lista
+        if "products" in extraction_result and not isinstance(extraction_result["products"], list):
+            issues.append(ValidationIssue(
+                code="INVALID_PRODUCTS_TYPE",
+                severity=ValidationSeverity.CRITICAL,
+                message="Campo 'products' deve ser uma lista",
+                field_path="products",
+                suggested_fix="Converter 'products' para lista"
+            ))
         
-        # 2. VALIDAÇÃO CATEGORIA (15%)
-        category = product.get("category", "")
-        scores.category_score = self._validate_category_confidence(category)
+        # Verificar se há produtos
+        if "products" in extraction_result and len(extraction_result["products"]) == 0:
+            issues.append(ValidationIssue(
+                code="NO_PRODUCTS_FOUND",
+                severity=ValidationSeverity.WARNING,
+                message="Nenhum produto encontrado no documento",
+                field_path="products",
+                suggested_fix="Verificar se o documento contém produtos ou revisar processo de extração"
+            ))
         
-        if scores.category_score < 80:
-            issues.append(f"Categoria inválida ou suspeita: '{category}'")
+        return issues
+    
+    def _validate_order_info(self, order_info: Dict[str, Any]) -> List[ValidationIssue]:
+        """Valida informações do pedido"""
+        issues = []
         
-        # 3. VALIDAÇÃO CORES (25%)
-        colors = product.get("colors", [])
-        scores.colors_score = self._validate_colors_confidence(colors)
+        # Verificar campos obrigatórios
+        required_fields = self.validation_rules["required_fields"]["order_info"]
+        for field in required_fields:
+            if field not in order_info or not order_info[field]:
+                issues.append(ValidationIssue(
+                    code="MISSING_ORDER_FIELD",
+                    severity=ValidationSeverity.WARNING,
+                    message=f"Campo '{field}' não encontrado em order_info",
+                    field_path=f"order_info.{field}",
+                    suggested_fix=f"Adicionar informação de '{field}' ao pedido"
+                ))
         
-        if scores.colors_score < 70:
-            issues.append(f"Problemas nas cores: {len(colors)} cores encontradas")
+        # Validar formato de data se presente
+        if "date" in order_info and order_info["date"]:
+            date_value = order_info["date"]
+            if not self._is_valid_date_format(date_value):
+                issues.append(ValidationIssue(
+                    code="INVALID_DATE_FORMAT",
+                    severity=ValidationSeverity.INFO,
+                    message=f"Formato de data pode estar incorreto: '{date_value}'",
+                    field_path="order_info.date",
+                    suggested_fix="Usar formato DD/MM/YYYY ou YYYY-MM-DD"
+                ))
         
-        # 4. VALIDAÇÃO TAMANHOS (25%)
-        scores.sizes_score = self._validate_sizes_confidence(colors)
-        
-        if scores.sizes_score < 70:
-            issues.append("Problemas nos tamanhos")
-        
-        # 5. VALIDAÇÃO PREÇOS (10%)
-        scores.prices_score = self._validate_prices_confidence(colors)
-        
-        if scores.prices_score < 50:
-            issues.append("Preços suspeitos ou em falta")
-        
-        # PONTUAÇÃO GERAL (média ponderada)
-        scores.overall_score = (
-            scores.material_code_score * 0.25 +
-            scores.category_score * 0.15 +
-            scores.colors_score * 0.25 +
-            scores.sizes_score * 0.25 +
-            scores.prices_score * 0.10
-        )
-        
-        scores.details = {
-            "issues": issues,
-            "product_number": product_number,
-            "material_code": material_code,
-            "colors_count": len(colors)
+        return issues
+    
+    def _validate_products(self, products: List[Dict[str, Any]]) -> Tuple[List[ValidationIssue], Dict[str, Any]]:
+        """Valida lista de produtos"""
+        issues = []
+        metrics = {
+            "total_products": len(products),
+            "valid_products": 0,
+            "total_colors": 0,
+            "valid_colors": 0,
+            "total_sizes": 0,
+            "valid_sizes": 0
         }
         
-        return scores
-    
-    def _validate_material_code_confidence(self, material_code: str) -> float:
-        """Valida confiança do material code"""
-        if not material_code or len(material_code) < 3:
-            return 0.0
+        seen_material_codes = set()
         
-        # Verificar padrões conhecidos
-        for pattern_name, pattern in self.material_code_patterns.items():
-            if re.match(pattern, material_code.upper()):
-                if pattern_name == 'alphanumeric_long':
-                    return 95.0  # Padrão mais confiável
-                elif pattern_name == 'numeric_long':
-                    return 85.0
-                elif pattern_name == 'mixed_format':
-                    return 75.0
+        for i, product in enumerate(products):
+            product_issues = self._validate_single_product(product, i, seen_material_codes)
+            issues.extend(product_issues)
+            
+            # Contar métricas
+            if len([issue for issue in product_issues if issue.severity in [ValidationSeverity.ERROR, ValidationSeverity.CRITICAL]]) == 0:
+                metrics["valid_products"] += 1
+            
+            # Contar cores e tamanhos
+            if "colors" in product and isinstance(product["colors"], list):
+                for color in product["colors"]:
+                    metrics["total_colors"] += 1
+                    if "sizes" in color and isinstance(color["sizes"], list):
+                        for size in color["sizes"]:
+                            metrics["total_sizes"] += 1
+        
+        return issues, metrics
+    
+    def _validate_single_product(self, product: Dict[str, Any], index: int, seen_codes: Set[str]) -> List[ValidationIssue]:
+        """Valida um produto individual"""
+        issues = []
+        base_path = f"products[{index}]"
+        
+        # Verificar campos obrigatórios
+        required_fields = self.validation_rules["required_fields"]["product"]
+        for field in required_fields:
+            if field not in product or not product[field]:
+                issues.append(ValidationIssue(
+                    code="MISSING_PRODUCT_FIELD",
+                    severity=ValidationSeverity.ERROR,
+                    message=f"Campo obrigatório '{field}' não encontrado no produto",
+                    field_path=f"{base_path}.{field}",
+                    suggested_fix=f"Adicionar campo '{field}' ao produto"
+                ))
+        
+        # Validar código de material
+        if "material_code" in product:
+            material_code = product["material_code"]
+            
+            # Verificar formato
+            if not re.match(self.validation_rules["field_formats"]["material_code"], str(material_code)):
+                issues.append(ValidationIssue(
+                    code="INVALID_MATERIAL_CODE_FORMAT",
+                    severity=ValidationSeverity.WARNING,
+                    message=f"Formato de código de material pode estar incorreto: '{material_code}'",
+                    field_path=f"{base_path}.material_code",
+                    suggested_fix="Verificar se o código segue o padrão alpanumérico"
+                ))
+            
+            # Verificar duplicação
+            if material_code in seen_codes:
+                issues.append(ValidationIssue(
+                    code="DUPLICATE_MATERIAL_CODE",
+                    severity=ValidationSeverity.WARNING,
+                    message=f"Código de material duplicado: '{material_code}'",
+                    field_path=f"{base_path}.material_code",
+                    suggested_fix="Verificar se produtos com mesmo código são realmente duplicatas"
+                ))
+            else:
+                seen_codes.add(material_code)
+        
+        # Validar categoria
+        if "category" in product:
+            category = product["category"]
+            if not self._is_valid_category(category):
+                issues.append(ValidationIssue(
+                    code="INVALID_CATEGORY",
+                    severity=ValidationSeverity.WARNING,
+                    message=f"Categoria não reconhecida: '{category}'",
+                    field_path=f"{base_path}.category",
+                    suggested_fix="Usar uma das categorias padrão do sistema"
+                ))
+        
+        # Validar cores
+        if "colors" in product and isinstance(product["colors"], list):
+            color_issues = self._validate_product_colors(product["colors"], base_path, product.get("category"))
+            issues.extend(color_issues)
+        
+        return issues
+    
+    def _validate_product_colors(self, colors: List[Dict[str, Any]], base_path: str, category: Optional[str] = None) -> List[ValidationIssue]:
+        """Valida cores de um produto"""
+        issues = []
+        
+        seen_color_codes = set()
+        
+        for i, color in enumerate(colors):
+            color_path = f"{base_path}.colors[{i}]"
+            
+            # Verificar campos obrigatórios
+            required_fields = self.validation_rules["required_fields"]["color"]
+            for field in required_fields:
+                if field not in color or not color[field]:
+                    issues.append(ValidationIssue(
+                        code="MISSING_COLOR_FIELD",
+                        severity=ValidationSeverity.ERROR,
+                        message=f"Campo obrigatório '{field}' não encontrado na cor",
+                        field_path=f"{color_path}.{field}",
+                        suggested_fix=f"Adicionar campo '{field}' à cor"
+                    ))
+            
+            # Validar código da cor
+            if "color_code" in color:
+                color_code = color["color_code"]
+                
+                # Verificar formato
+                if not re.match(self.color_patterns["numeric_code"], str(color_code)):
+                    issues.append(ValidationIssue(
+                        code="INVALID_COLOR_CODE_FORMAT",
+                        severity=ValidationSeverity.WARNING,
+                        message=f"Formato de código de cor pode estar incorreto: '{color_code}'",
+                        field_path=f"{color_path}.color_code",
+                        suggested_fix="Usar código numérico de 3 dígitos"
+                    ))
+                
+                # Verificar duplicação
+                if color_code in seen_color_codes:
+                    issues.append(ValidationIssue(
+                        code="DUPLICATE_COLOR_CODE",
+                        severity=ValidationSeverity.WARNING,
+                        message=f"Código de cor duplicado: '{color_code}'",
+                        field_path=f"{color_path}.color_code",
+                        suggested_fix="Verificar se cores com mesmo código são realmente duplicatas"
+                    ))
                 else:
-                    return 60.0
+                    seen_color_codes.add(color_code)
+            
+            # Validar preços
+            for price_field in ["unit_price", "sales_price"]:
+                if price_field in color and color[price_field] is not None:
+                    price_issues = self._validate_price(color[price_field], f"{color_path}.{price_field}", category)
+                    issues.extend(price_issues)
+            
+            # Validar tamanhos
+            if "sizes" in color and isinstance(color["sizes"], list):
+                size_issues = self._validate_color_sizes(color["sizes"], color_path, category)
+                issues.extend(size_issues)
         
-        # Verificar se tem caracteres válidos
-        if re.match(r'^[A-Z0-9]{4,}$', material_code.upper()):
-            return 40.0
-        
-        return 10.0  # Muito suspeito
+        return issues
     
-    def _validate_category_confidence(self, category: str) -> float:
-        """Valida confiança da categoria"""
-        if not category:
+    def _validate_color_sizes(self, sizes: List[Dict[str, Any]], base_path: str, category: Optional[str] = None) -> List[ValidationIssue]:
+        """Valida tamanhos de uma cor"""
+        issues = []
+        
+        seen_sizes = set()
+        
+        for i, size in enumerate(sizes):
+            size_path = f"{base_path}.sizes[{i}]"
+            
+            # Verificar campos obrigatórios
+            required_fields = self.validation_rules["required_fields"]["size"]
+            for field in required_fields:
+                if field not in size or size[field] is None:
+                    issues.append(ValidationIssue(
+                        code="MISSING_SIZE_FIELD",
+                        severity=ValidationSeverity.ERROR,
+                        message=f"Campo obrigatório '{field}' não encontrado no tamanho",
+                        field_path=f"{size_path}.{field}",
+                        suggested_fix=f"Adicionar campo '{field}' ao tamanho"
+                    ))
+            
+            # Validar tamanho
+            if "size" in size:
+                size_value = str(size["size"]).upper()
+                
+                if not self._is_valid_size(size_value, category):
+                    issues.append(ValidationIssue(
+                        code="INVALID_SIZE",
+                        severity=ValidationSeverity.WARNING,
+                        message=f"Tamanho não reconhecido: '{size_value}'",
+                        field_path=f"{size_path}.size",
+                        suggested_fix="Verificar se o tamanho está correto"
+                    ))
+                
+                # Verificar duplicação
+                if size_value in seen_sizes:
+                    issues.append(ValidationIssue(
+                        code="DUPLICATE_SIZE",
+                        severity=ValidationSeverity.WARNING,
+                        message=f"Tamanho duplicado: '{size_value}'",
+                        field_path=f"{size_path}.size",
+                        suggested_fix="Remover tamanhos duplicados"
+                    ))
+                else:
+                    seen_sizes.add(size_value)
+            
+            # Validar quantidade
+            if "quantity" in size:
+                quantity = size["quantity"]
+                
+                try:
+                    qty_num = float(quantity)
+                    
+                    if qty_num < self.validation_rules["business_rules"]["min_quantity"]:
+                        issues.append(ValidationIssue(
+                            code="INVALID_QUANTITY_LOW",
+                            severity=ValidationSeverity.WARNING,
+                            message=f"Quantidade muito baixa: {quantity}",
+                            field_path=f"{size_path}.quantity",
+                            suggested_fix="Verificar se a quantidade está correta"
+                        ))
+                    
+                    if qty_num > self.validation_rules["business_rules"]["max_quantity"]:
+                        issues.append(ValidationIssue(
+                            code="INVALID_QUANTITY_HIGH",
+                            severity=ValidationSeverity.WARNING,
+                            message=f"Quantidade muito alta: {quantity}",
+                            field_path=f"{size_path}.quantity",
+                            suggested_fix="Verificar se a quantidade está correta"
+                        ))
+                
+                except (ValueError, TypeError):
+                    issues.append(ValidationIssue(
+                        code="INVALID_QUANTITY_FORMAT",
+                        severity=ValidationSeverity.ERROR,
+                        message=f"Formato de quantidade inválido: '{quantity}'",
+                        field_path=f"{size_path}.quantity",
+                        suggested_fix="Usar apenas números para quantidade"
+                    ))
+        
+        return issues
+    
+    def _validate_price(self, price: Any, field_path: str, category: Optional[str] = None) -> List[ValidationIssue]:
+        """Valida um preço"""
+        issues = []
+        
+        try:
+            price_num = float(price)
+            
+            # Verificar limites gerais
+            if price_num < self.validation_rules["business_rules"]["min_price"]:
+                issues.append(ValidationIssue(
+                    code="PRICE_TOO_LOW",
+                    severity=ValidationSeverity.WARNING,
+                    message=f"Preço muito baixo: {price}",
+                    field_path=field_path,
+                    suggested_fix="Verificar se o preço está correto"
+                ))
+            
+            if price_num > self.validation_rules["business_rules"]["max_price"]:
+                issues.append(ValidationIssue(
+                    code="PRICE_TOO_HIGH",
+                    severity=ValidationSeverity.WARNING,
+                    message=f"Preço muito alto: {price}",
+                    field_path=field_path,
+                    suggested_fix="Verificar se o preço está correto"
+                ))
+            
+            # Verificar faixa esperada por categoria
+            if category and category.upper() in self.price_ranges:
+                expected_price = self.price_ranges[category.upper()]
+                ratio = price_num / expected_price
+                
+                # Se o preço estiver muito fora da faixa esperada
+                if ratio < 0.3 or ratio > 3.0:
+                    issues.append(ValidationIssue(
+                        code="PRICE_OUTSIDE_EXPECTED_RANGE",
+                        severity=ValidationSeverity.INFO,
+                        message=f"Preço fora da faixa esperada para categoria '{category}': {price} (esperado: ~{expected_price})",
+                        field_path=field_path,
+                        suggested_fix="Verificar se categoria e preço estão corretos",
+                        confidence=0.7
+                    ))
+        
+        except (ValueError, TypeError):
+            issues.append(ValidationIssue(
+                code="INVALID_PRICE_FORMAT",
+                severity=ValidationSeverity.ERROR,
+                message=f"Formato de preço inválido: '{price}'",
+                field_path=field_path,
+                suggested_fix="Usar formato numérico para preços"
+            ))
+        
+        return issues
+    
+    def _is_valid_date_format(self, date_str: str) -> bool:
+        """Verifica se uma string tem formato de data válido"""
+        date_patterns = [
+            r"\d{2}/\d{2}/\d{4}",      # DD/MM/YYYY
+            r"\d{4}-\d{2}-\d{2}",      # YYYY-MM-DD
+            r"\d{2}-\d{2}-\d{4}",      # DD-MM-YYYY
+            r"\d{2}\.\d{2}\.\d{4}"     # DD.MM.YYYY
+        ]
+        
+        return any(re.match(pattern, date_str) for pattern in date_patterns)
+    
+    def _is_valid_category(self, category: str) -> bool:
+        """Verifica se uma categoria é válida"""
+        from app.data.reference_data import CATEGORIES
+        
+        category_upper = category.upper()
+        return category_upper in CATEGORIES
+    
+    def _is_valid_size(self, size: str, category: Optional[str] = None) -> bool:
+        """Verifica se um tamanho é válido"""
+        size_upper = size.upper()
+        
+        # Verificar em todos os padrões conhecidos
+        for pattern_list in self.size_patterns.values():
+            if size_upper in pattern_list:
+                return True
+        
+        # Verificar padrões numéricos comuns
+        if re.match(r"^\d{2}$", size):
+            return True
+        
+        return False
+    
+    def _calculate_validation_score(self, issues: List[ValidationIssue], metrics: Dict[str, Any]) -> float:
+        """Calcula score de validação baseado nos problemas encontrados"""
+        if metrics["total_products"] == 0:
             return 0.0
         
-        category_upper = category.upper().strip()
-        
-        # Categoria válida exata
-        if category_upper in [cat.upper() for cat in CATEGORIES]:
-            return 100.0
-        
-        # Verificar semelhanças
-        for valid_cat in CATEGORIES:
-            if category_upper in valid_cat.upper() or valid_cat.upper() in category_upper:
-                return 80.0
-        
-        # Categorias que podem ser mapeadas
-        mappable_keywords = {
-            'MAGLIA', 'KNIT', 'SWEATER': 70.0,
-            'ABITO', 'DRESS': 70.0,
-            'GIACCONE', 'CAPPOTTO', 'COAT', 'JACKET': 70.0,
-            'PANTALONE', 'PANT', 'TROUSER': 70.0,
-            'CAMICIA', 'SHIRT': 70.0,
-            'GONNA', 'SKIRT': 70.0
+        # Peso por severidade
+        severity_weights = {
+            ValidationSeverity.INFO: 0.1,
+            ValidationSeverity.WARNING: 0.3,
+            ValidationSeverity.ERROR: 0.7,
+            ValidationSeverity.CRITICAL: 1.0
         }
         
-        for keywords, score in mappable_keywords.items():
-            if any(keyword in category_upper for keyword in keywords.split()):
-                return score
+        # Calcular penalidades
+        total_penalty = 0.0
+        for issue in issues:
+            total_penalty += severity_weights[issue.severity] * issue.confidence
         
-        return 20.0  # Categoria desconhecida
+        # Score baseado em produtos válidos e penalidades
+        base_score = metrics["valid_products"] / metrics["total_products"]
+        penalty_factor = min(1.0, total_penalty / metrics["total_products"])
+        
+        final_score = max(0.0, base_score - penalty_factor)
+        
+        return round(final_score, 3)
     
-    def _validate_colors_confidence(self, colors: List[Dict[str, Any]]) -> float:
-        """Valida confiança das cores"""
-        if not colors:
-            return 0.0
+    def _group_issues_by_severity(self, issues: List[ValidationIssue]) -> Dict[str, int]:
+        """Agrupa issues por severidade"""
+        counts = {severity.value: 0 for severity in ValidationSeverity}
         
-        total_score = 0.0
-        valid_colors = 0
+        for issue in issues:
+            counts[issue.severity.value] += 1
         
-        for color in colors:
-            color_score = 0.0
-            
-            # Verificar código da cor
-            color_code = str(color.get("color_code", "")).strip()
-            if color_code:
-                for pattern in self.color_code_patterns.values():
-                    if re.match(pattern, color_code.upper()):
-                        color_score += 40.0
-                        break
-                else:
-                    color_score += 20.0  # Código presente mas formato desconhecido
-            
-            # Verificar nome da cor
-            color_name = color.get("color_name", "").strip()
-            if color_name and len(color_name) > 1:
-                color_score += 30.0
-            
-            # Verificar tamanhos
-            sizes = color.get("sizes", [])
-            if sizes:
-                color_score += 30.0
-            
-            if color_score > 50:
-                valid_colors += 1
-                total_score += color_score
-        
-        if valid_colors == 0:
-            return 0.0
-        
-        return min(100.0, total_score / valid_colors)
+        return counts
     
-    def _validate_sizes_confidence(self, colors: List[Dict[str, Any]]) -> float:
-        """Valida confiança dos tamanhos"""
-        if not colors:
-            return 0.0
-        
-        total_sizes = 0
-        valid_sizes = 0
-        
-        for color in colors:
-            for size_info in color.get("sizes", []):
-                total_sizes += 1
-                size = str(size_info.get("size", "")).strip().upper()
-                quantity = size_info.get("quantity", 0)
-                
-                # Verificar se é um tamanho válido
-                size_valid = False
-                for pattern in self.size_patterns.values():
-                    if re.match(pattern, size):
-                        size_valid = True
-                        break
-                
-                # Verificar quantidade
-                quantity_valid = isinstance(quantity, (int, float)) and quantity > 0
-                
-                if size_valid and quantity_valid:
-                    valid_sizes += 1
-                elif size_valid or quantity_valid:
-                    valid_sizes += 0.5
-        
-        if total_sizes == 0:
-            return 0.0
-        
-        return min(100.0, (valid_sizes / total_sizes) * 100)
-    
-    def _validate_prices_confidence(self, colors: List[Dict[str, Any]]) -> float:
-        """Valida confiança dos preços"""
-        if not colors:
-            return 0.0
-        
-        total_prices = 0
-        valid_prices = 0
-        
-        for color in colors:
-            # Verificar preço unitário
-            unit_price = color.get("unit_price")
-            if isinstance(unit_price, (int, float)) and unit_price > 0:
-                valid_prices += 1
-            total_prices += 1
-            
-            # Verificar preço de venda (opcional)
-            sales_price = color.get("sales_price")
-            if isinstance(sales_price, (int, float)) and sales_price > 0:
-                valid_prices += 0.5
-            total_prices += 0.5
-        
-        if total_prices == 0:
-            return 50.0  # Neutro se não há preços para verificar
-        
-        return min(100.0, (valid_prices / total_prices) * 100)
-    
-    def _generate_product_stats(self, product: Dict[str, Any]) -> ProductStats:
-        """Gera estatísticas detalhadas de um produto"""
-        material_code = product.get("material_code", "N/A")
-        colors = product.get("colors", [])
-        
-        total_colors = len(colors)
-        total_sizes = 0
-        total_quantity = 0
-        size_distribution = Counter()
-        prices = []
-        
-        for color in colors:
-            sizes = color.get("sizes", [])
-            total_sizes += len(sizes)
-            
-            for size_info in sizes:
-                quantity = size_info.get("quantity", 0)
-                if isinstance(quantity, (int, float)):
-                    total_quantity += quantity
-                    size = size_info.get("size", "")
-                    size_distribution[size] += quantity
-            
-            # Coletar preços
-            unit_price = color.get("unit_price", 0)
-            if isinstance(unit_price, (int, float)) and unit_price > 0:
-                prices.append(unit_price)
-        
-        price_range = (min(prices), max(prices)) if prices else (0.0, 0.0)
-        
-        # Calcular confiança baseada nas estatísticas
-        confidence = 100.0
-        if total_colors == 0:
-            confidence -= 30
-        if total_sizes == 0:
-            confidence -= 30
-        if total_quantity == 0:
-            confidence -= 20
-        if not prices:
-            confidence -= 20
-        
-        return ProductStats(
-            material_code=material_code,
-            total_colors=total_colors,
-            total_sizes=total_sizes,
-            total_quantity=int(total_quantity),
-            price_range=price_range,
-            size_distribution=dict(size_distribution),
-            confidence_score=max(0.0, confidence)
-        )
-    
-    def _get_confidence_level(self, score: float) -> str:
-        """Determina nível de confiança baseado na pontuação"""
-        if score >= 80:
-            return "ALTO"
-        elif score >= 50:
-            return "MÉDIO"
-        else:
-            return "BAIXO"
-    
-    def _generate_validation_report(
-        self, 
-        validated_products: List[Dict[str, Any]], 
-        scores: List[float],
-        material_code_stats: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Gera relatório detalhado de validação"""
-        
-        # Classificar produtos por confiança
-        high_confidence = sum(1 for score in scores if score >= 80)
-        medium_confidence = sum(1 for score in scores if 50 <= score < 80)
-        low_confidence = sum(1 for score in scores if score < 50)
-        
-        # Problemas mais comuns
-        all_issues = []
-        for product in validated_products:
-            issues = product.get("_validation", {}).get("issues_found", [])
-            all_issues.extend(issues)
-        
-        common_issues = Counter(all_issues).most_common(5)
-        
-        # Estatísticas de material codes
-        material_stats_summary = {}
-        for code, stats in material_code_stats.items():
-            material_stats_summary[code] = {
-                "colors": stats["colors_found"],
-                "sizes": stats["sizes_found"], 
-                "total_qty": stats["total_quantity"],
-                "confidence": f"{stats['confidence']:.1f}%",
-                "top_sizes": dict(Counter(stats["size_distribution"]).most_common(3))
-            }
-        
+    def _issue_to_dict(self, issue: ValidationIssue) -> Dict[str, Any]:
+        """Converte ValidationIssue para dicionário"""
         return {
-            "summary": {
-                "total_products": len(validated_products),
-                "average_confidence": f"{sum(scores)/len(scores):.1f}%",
-                "confidence_distribution": {
-                    "high_confidence": f"{high_confidence} ({high_confidence/len(scores)*100:.1f}%)",
-                    "medium_confidence": f"{medium_confidence} ({medium_confidence/len(scores)*100:.1f}%)",
-                    "low_confidence": f"{low_confidence} ({low_confidence/len(scores)*100:.1f}%)"
-                }
-            },
-            "material_code_analysis": material_stats_summary,
-            "common_issues": [{"issue": issue, "count": count} for issue, count in common_issues],
-            "validation_method": "universal_confidence_scoring",
-            "recommendations": self._generate_recommendations(scores, common_issues)
+            "code": issue.code,
+            "severity": issue.severity.value,
+            "message": issue.message,
+            "field_path": issue.field_path,
+            "suggested_fix": issue.suggested_fix,
+            "confidence": issue.confidence
         }
     
-    def _generate_recommendations(
-        self, 
-        scores: List[float], 
-        common_issues: List[Tuple[str, int]]
-    ) -> List[str]:
-        """Gera recomendações baseadas na validação"""
+    def _generate_recommendations(self, issues: List[ValidationIssue], metrics: Dict[str, Any]) -> List[str]:
+        """Gera recomendações baseadas nos problemas encontrados"""
         recommendations = []
         
-        avg_score = sum(scores) / len(scores)
+        # Contar tipos de problemas
+        issue_counts = {}
+        for issue in issues:
+            issue_counts[issue.code] = issue_counts.get(issue.code, 0) + 1
         
-        if avg_score < 70:
-            recommendations.append("Confiança geral baixa - revisar extração manual")
+        # Recomendações baseadas em padrões
+        if issue_counts.get("MISSING_PRODUCT_FIELD", 0) > 0:
+            recommendations.append("Verificar processo de extração para garantir captura de campos obrigatórios")
         
-        if len([s for s in scores if s < 50]) > len(scores) * 0.3:
-            recommendations.append("Muitos produtos com baixa confiança - verificar qualidade do PDF")
+        if issue_counts.get("INVALID_PRICE_FORMAT", 0) > 0:
+            recommendations.append("Revisar detecção de preços para garantir formato numérico correto")
         
-        # Recomendações baseadas em problemas comuns
-        for issue, count in common_issues[:3]:
-            if "Material code" in issue and count > 2:
-                recommendations.append("Verificar padrões de material codes no documento")
-            elif "Categoria" in issue and count > 2:
-                recommendations.append("Melhorar mapeamento de categorias")
-            elif "Preços" in issue and count > 2:
-                recommendations.append("Verificar formatação de preços no documento")
+        if issue_counts.get("DUPLICATE_MATERIAL_CODE", 0) > 0:
+            recommendations.append("Implementar verificação de duplicatas durante extração")
         
-        if not recommendations:
-            recommendations.append("Qualidade de extração boa - nenhuma ação necessária")
+        if metrics["valid_products"] / max(1, metrics["total_products"]) < 0.8:
+            recommendations.append("Taxa de produtos válidos baixa - revisar processo de extração")
+        
+        if len(issues) == 0:
+            recommendations.append("Dados extraídos têm boa qualidade - nenhum problema crítico encontrado")
         
         return recommendations
-    
-    def _log_validation_summary(self, report: Dict[str, Any]):
-        """Log resumido dos resultados de validação"""
-        summary = report["summary"]
-        
-        logger.info("=" * 70)
-        logger.info("📊 RELATÓRIO DE VALIDAÇÃO UNIVERSAL")
-        logger.info("=" * 70)
-        logger.info(f"   Total de produtos: {summary['total_products']}")
-        logger.info(f"   Confiança média: {summary['average_confidence']}")
-        logger.info("   Distribuição de confiança:")
-        logger.info(f"     🟢 Alta: {summary['confidence_distribution']['high_confidence']}")
-        logger.info(f"     🟡 Média: {summary['confidence_distribution']['medium_confidence']}")
-        logger.info(f"     🔴 Baixa: {summary['confidence_distribution']['low_confidence']}")
-        
-        if report["material_code_analysis"]:
-            logger.info(f"\n📋 ANÁLISE POR MATERIAL CODE ({len(report['material_code_analysis'])} códigos):")
-            for code, stats in list(report["material_code_analysis"].items())[:5]:
-                logger.info(f"   • {code}: {stats['colors']} cores, {stats['sizes']} tamanhos, "
-                           f"{stats['total_qty']} peças (confiança: {stats['confidence']})")
-        
-        if report["common_issues"]:
-            logger.info(f"\n⚠️  PROBLEMAS MAIS COMUNS:")
-            for issue in report["common_issues"][:3]:
-                logger.info(f"   • {issue['issue']} ({issue['count']}x)")
-        
-        if report["recommendations"]:
-            logger.info(f"\n💡 RECOMENDAÇÕES:")
-            for rec in report["recommendations"]:
-                logger.info(f"   • {rec}")
-        
-        logger.info("=" * 70)
-    
-    def get_detailed_report(self) -> Dict[str, Any]:
-        """Retorna relatório detalhado de todas as validações"""
-        return {
-            "global_statistics": self.validation_stats,
-            "validation_patterns": {
-                "material_codes": self.material_code_patterns,
-                "sizes": self.size_patterns,
-                "colors": self.color_code_patterns
-            }
-        }
