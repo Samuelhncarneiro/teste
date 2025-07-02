@@ -59,7 +59,7 @@ class GeminiExtractor(BaseExtractor):
         context_info = await self.context_agent.analyze_document(document_path)
         
         logger.info("Detectando layout do documento...")
-        layout_analysis = await self.layout_detector.analyze_documentcombined_result_structure(document_path)
+        layout_analysis = await self.layout_detector.analyze_document_structure(document_path)
         
         layout_type = layout_analysis.get('layout_type', 'UNKNOWN')
         confidence = layout_analysis.get('confidence', 0.0)

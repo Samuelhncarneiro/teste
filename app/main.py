@@ -3,6 +3,7 @@ import os
 import json
 import logging
 import time
+import math
 from typing import Optional, Dict, Any
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, BackgroundTasks, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,6 +19,13 @@ from app.config import (
     CLEANUP_INTERVAL_HOURS, TEMP_RETENTION_HOURS, RESULTS_RETENTION_HOURS,
     LOG_FORMAT, LOG_LEVEL
 )
+
+try:
+    from app.utils.json_utils import safe_json_dump, fix_nan_in_products, sanitize_for_json
+    has_json_utils = True
+except ImportError:
+    has_json_utils = False
+    logger.warning("Módulo json_utils não encontrado, usar serialização padrão")
 
 from app.models.schemas import JobStatus
 from app.services.job_service import JobService
@@ -488,33 +496,49 @@ async def get_job_excel(job_id: str, season: str = None):
 
 @app.get("/job/{job_id}/json", summary="Obter resultado em JSON")
 async def get_job_json(job_id: str):
-    from urllib.parse import unquote
-    job_id = unquote(job_id)
-    
-    logger.info(f"🔍 Buscando job: '{job_id}'")
-    
     job = job_service.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job não encontrado")
     
-    logger.info(f"✅ Job encontrado. Status: {job.get('status')}")
+    if job["status"] != "completed":
+        raise HTTPException(status_code=400, detail="Job ainda em processamento")
     
-    # VERIFICAR SE O PROCESSAMENTO FALHOU
-    model_results = job.get("model_results", {})
-    if "gemini" in model_results:
-        gemini_results = model_results["gemini"]
-        
-        # Se há erro, mostrar o erro
-        if "error" in gemini_results:
-            error_msg = gemini_results["error"]
-            logger.error(f"❌ Erro no processamento: {error_msg}")
-            raise HTTPException(status_code=500, detail=f"Erro no processamento: {error_msg}")
-        
-        # Se há resultado, retornar
-        if "result" in gemini_results:
-            return JSONResponse(content=gemini_results["result"], status_code=200)
+    if "gemini" not in job["model_results"] or "result" not in job["model_results"]["gemini"]:
+        raise HTTPException(status_code=404, detail="Resultados não disponíveis")
     
-    raise HTTPException(status_code=404, detail="Resultados não disponíveis")
+    try:
+        extraction_result = job["model_results"]["gemini"]["result"]
+        
+        if has_json_utils:
+            try:
+                from app.utils.recovery_system import ProcessingRecovery
+                extraction_result = ProcessingRecovery.fix_extraction_result(extraction_result)
+            except ImportError:
+                pass
+        
+        def sanitize_datetime(obj):
+            import datetime
+            if isinstance(obj, dict):
+                return {k: sanitize_datetime(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [sanitize_datetime(item) for item in obj]
+            elif isinstance(obj, datetime.datetime):
+                return obj.isoformat()
+            elif isinstance(obj, datetime.date):
+                return obj.isoformat()
+            elif isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+                return None
+            else:
+                return obj
+        
+        extraction_result = sanitize_datetime(extraction_result)
+        
+        return JSONResponse(content=extraction_result, status_code=200)
+        
+    except Exception as e:
+        logger.exception(f"Erro ao gerar JSON: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Erro ao gerar JSON: {str(e)}")
+
 
 @app.get("/jobs", summary="Listar todos os jobs")
 async def list_jobs():

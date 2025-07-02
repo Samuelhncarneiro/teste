@@ -1,10 +1,11 @@
-# app/utils/product_validator.py - NOVO MÓDULO DE VALIDAÇÃO
+# app/utils/product_validator.py
+import re
+import logging
+from typing import Dict, Any, List, Tuple
+
+logger = logging.getLogger(__name__)
 
 class ProductValidator:
-    """
-    CORREÇÃO: Validador específico para produtos LIUJO/PENNYBLACK
-    """
-    
     def __init__(self):
         self.valid_material_code_patterns = [
             r'^CF\d{4}[A-Z]{2,6}\d*$',
