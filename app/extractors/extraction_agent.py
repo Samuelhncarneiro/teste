@@ -34,22 +34,17 @@ class ExtractionAgent:
         is_first_page = (page_number == 1)
         
         try:
-            # Otimizar imagem para melhor processamento
             optimized_path = optimize_image(image_path, os.path.dirname(image_path))
             
-            # Carregar a imagem
             image = Image.open(optimized_path)
             
-            # Preparar o prompt JSON para o exemplo de resposta esperada
             json_template = self._get_json_template()
             
-            # Preparar prompt adequado para a página
             if is_first_page:
                 prompt = self._create_first_page_prompt(
                     context, page_number, total_pages, json_template
                 )
             else:
-                # Para páginas adicionais, informar sobre produtos já encontrados
                 previous_products_count = len(previous_result.get("products", [])) if previous_result else 0
                 prompt = self._create_additional_page_prompt(
                     context, page_number, total_pages, previous_products_count, json_template
@@ -493,3 +488,33 @@ class ExtractionAgent:
         except Exception as e:
             logger.warning(f"Falha na tentativa de recuperação: {str(e)}")
             return None
+    
+    def _clean_single_color(self, color: Dict[str, Any], product_name: str, page_number: int) -> Optional[Dict[str, Any]]:
+        if not isinstance(color, dict):
+            return None
+
+        if isinstance(color["sizes"], list):
+            # Primeiro, extrair tamanhos preliminares
+            preliminary_sizes = []
+            for size in color["sizes"]:
+                if isinstance(size, dict) and "size" in size and "quantity" in size:
+                    try:
+                        quantity = float(size["quantity"])
+                        if quantity > 0:
+                            size["quantity"] = int(quantity) if quantity.is_integer() else quantity
+                            preliminary_sizes.append(size)
+                    except (ValueError, TypeError):
+                        continue
+            
+            category = self._get_product_category(product_name)
+            clean_sizes = self.size_detector.normalize_size_extraction(
+                preliminary_sizes, category
+            )
+            
+            color["sizes"] = clean_sizes
+            
+            if len(preliminary_sizes) != len(clean_sizes):
+                rejected = len(preliminary_sizes) - len(clean_sizes)
+                logger.debug(f"Página {page_number}: {rejected} tamanhos inválidos rejeitados em '{product_name}'")
+        
+        return color if color.get("sizes") else None

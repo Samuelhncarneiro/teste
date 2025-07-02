@@ -422,8 +422,10 @@ async def get_job_status(job_id: str):
     - **job_id**: ID do job
     """
     logger.info(f"🔍 Consultando status do job: {job_id}")
-    
+
+    job_id = unquote(job_id)
     job = job_service.get_job(job_id)
+
     if not job:
         raise HTTPException(
             status_code=404, 
@@ -446,12 +448,7 @@ async def get_job_status(job_id: str):
 
 @app.get("/job/{job_id}/excel", summary="Obter resultado em Excel")
 async def get_job_excel(job_id: str, season: str = None):
-    """
-    📊 Retorna os resultados do job em formato Excel.
-    
-    - **job_id**: ID do job
-    - **season**: Temporada (opcional, ex: "FW23")
-    """
+
     job_id = unquote(job_id)
     job = job_service.get_job(job_id)
     if not job:
@@ -491,24 +488,33 @@ async def get_job_excel(job_id: str, season: str = None):
 
 @app.get("/job/{job_id}/json", summary="Obter resultado em JSON")
 async def get_job_json(job_id: str):
-    """
-    📋 Retorna os resultados do job em formato JSON.
-    
-    - **job_id**: ID do job
-    """
+    from urllib.parse import unquote
     job_id = unquote(job_id)
+    
+    logger.info(f"🔍 Buscando job: '{job_id}'")
+    
     job = job_service.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job não encontrado")
     
-    if job["status"] != "completed":
-        raise HTTPException(status_code=400, detail="Job ainda em processamento")
+    logger.info(f"✅ Job encontrado. Status: {job.get('status')}")
     
-    if "gemini" not in job["model_results"] or "result" not in job["model_results"]["gemini"]:
-        raise HTTPException(status_code=404, detail="Resultados não disponíveis")
+    # VERIFICAR SE O PROCESSAMENTO FALHOU
+    model_results = job.get("model_results", {})
+    if "gemini" in model_results:
+        gemini_results = model_results["gemini"]
+        
+        # Se há erro, mostrar o erro
+        if "error" in gemini_results:
+            error_msg = gemini_results["error"]
+            logger.error(f"❌ Erro no processamento: {error_msg}")
+            raise HTTPException(status_code=500, detail=f"Erro no processamento: {error_msg}")
+        
+        # Se há resultado, retornar
+        if "result" in gemini_results:
+            return JSONResponse(content=gemini_results["result"], status_code=200)
     
-    extraction_result = job["model_results"]["gemini"]["result"]
-    return JSONResponse(content=extraction_result, status_code=200)
+    raise HTTPException(status_code=404, detail="Resultados não disponíveis")
 
 @app.get("/jobs", summary="Listar todos os jobs")
 async def list_jobs():
