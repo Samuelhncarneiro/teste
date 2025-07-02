@@ -204,13 +204,7 @@ class GeminiExtractor(BaseExtractor):
         
         return context + strategy_update
 
-    async def extract_document(
-        self, 
-        document_path: str,
-        job_id: str,
-        jobs_store: Dict[str, Any],
-        update_progress_callback: Callable
-    ) -> Dict[str, Any]:
+    async def extract_document(self, document_path: str, job_id: str, jobs_store: Dict[str, Any], update_progress_callback) -> Dict[str, Any]:
 
         start_time = time.time()
         
@@ -315,9 +309,33 @@ class GeminiExtractor(BaseExtractor):
             
             await self._run_product_recovery(image_paths, combined_result)
             
+
             total_products = len(combined_result["products"])
             logger.info(f"🎉 EXTRAÇÃO CONCLUÍDA - Total de produtos: {total_products}")
             
+            logger.info("=== INICIANDO RECUPERAÇÃO DE PRODUTOS PERDIDOS ===")
+            
+            total_recovered = 0
+            for page_num, img_path in enumerate(image_paths, start=1):
+                page_products = []
+                if page_num <= len(self.page_results_history):
+                    page_result = self.page_results_history[page_num - 1]
+                    page_products = page_result.get("products", [])
+                
+                # Tentar recuperar produtos perdidos
+                recovered_products = await self.product_recovery.recover_missing_products(
+                    img_path, page_products, page_num
+                )
+                
+                if recovered_products:
+                    # Adicionar produtos recuperados ao resultado
+                    combined_result["products"].extend(recovered_products)
+                    total_recovered += len(recovered_products)
+                    logger.info(f"Página {page_num}: {len(recovered_products)} produtos recuperados")
+            
+            if total_recovered > 0:
+                logger.info(f"RECUPERAÇÃO CONCLUÍDA: {total_recovered} produtos adicionais recuperados")
+
             if combined_result["products"]:
                 try:
                     mapped_products = self.ai_color_mapping_agent.map_product_colors(
@@ -422,13 +440,14 @@ class GeminiExtractor(BaseExtractor):
             
             update_progress_callback(job_id)
             
-            rocessing_time = time.time() - start_time
+            processing_time = time.time() - start_time
             self.monitor.finalize_monitoring(processing_time)
 
             logger.info(f"⏱️ Tempo total de processamento: {processing_time:.2f}s")  
             logger.info(f"📊 Taxa de produtos por segundo: {total_products/processing_time:.2f}")
 
-            combined_result["_metadata"]["monitoring_report"] = self.monitor.get_detailed_report()
+            detailed_report = self.monitor.get_detailed_report()
+            combined_result["_metadata"]["monitoring_report"] = detailed_report
 
             return combined_result
                 
