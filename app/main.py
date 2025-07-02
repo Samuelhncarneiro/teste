@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 import pandas as pd
 from datetime import datetime
+from urllib.parse import unquote
 
 # Imports originais mantidos
 from app.config import (
@@ -451,6 +452,7 @@ async def get_job_excel(job_id: str, season: str = None):
     - **job_id**: ID do job
     - **season**: Temporada (opcional, ex: "FW23")
     """
+    job_id = unquote(job_id)
     job = job_service.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job não encontrado")
@@ -459,7 +461,9 @@ async def get_job_excel(job_id: str, season: str = None):
         raise HTTPException(status_code=400, detail="Job ainda em processamento")
     
     # Verificar se temos resultados
-    if "gemini" not in job["model_results"] or "result" not in job["model_results"]["gemini"]:
+    if "gemini" not in job.get("model_results", {}) or "result" not in job.get("model_results", {}).get("gemini", {}):
+        logger.warning(f"Job {job_id} não tem resultados gemini disponíveis. Status: {job.get('status')}")
+        logger.warning(f"Model results keys: {list(job.get('model_results', {}).keys())}")
         raise HTTPException(status_code=404, detail="Resultados não disponíveis")
     
     try:
@@ -492,6 +496,7 @@ async def get_job_json(job_id: str):
     
     - **job_id**: ID do job
     """
+    job_id = unquote(job_id)
     job = job_service.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job não encontrado")
