@@ -22,14 +22,15 @@ from app.data.reference_data import (get_supplier_code, get_markup, get_category
 from app.utils.json_utils import safe_json_dump, fix_nan_in_products, sanitize_for_json
 from app.utils.supplier_assignment import determine_best_supplier, assign_supplier_to_products
 
-logger = logging.getLogger(__name__)
-
 try:
-    from app.utils.json_utils import safe_json_dump, fix_nan_in_products, sanitize_for_json
-    has_json_utils = True
-except ImportError:
-    has_json_utils = False
-    logger.warning("Módulo json_utils não encontrado, usar serialização padrão")
+    from app.extractors.validation.universal_validation_agent import UniversalValidationAgent
+    from app.extractors.validation.data_verification_agent import DataVerificationAgent
+    VALIDATION_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"Agentes de validação não disponíveis: {str(e)}")
+    VALIDATION_AVAILABLE = False
+
+logger = logging.getLogger(__name__)
 
 class GeminiExtractor(BaseExtractor):
     def __init__(self, api_key: str = GEMINI_API_KEY):
@@ -41,9 +42,19 @@ class GeminiExtractor(BaseExtractor):
         self.layout_detector = LayoutDetetionAgent(api_key)
         self.strategy_agent = GenericStrategyAgent()
 
+        if VALIDATION_AVAILABLE:
+            self.universal_validator = UniversalValidationAgent(api_key)
+            self.data_verifier = DataVerificationAgent(api_key)
+            logger.info("✅ Agentes de validação universal carregados")
+        else:
+            self.universal_validator = None
+            self.data_verifier = None
+            logger.warning("⚠️ Sistema funcionando sem validação universal")
+
         self.current_layout_analysis = {}
         self.current_strategy = None
         self.page_results_history = []
+        self.processed_images = []
 
     async def analyze_context(self, document_path: str) -> str:
         logger.info("🔧 Usando análise clássica")
@@ -332,6 +343,53 @@ class GeminiExtractor(BaseExtractor):
                     logger.error(f"Erro no mapeamento AI de cores: {str(e)}")
                     combined_result["_ai_color_mapping"] = {"error": str(e)}
             
+            #########################################################################################
+            # VALIDAÇÃO UNIVERSAL COM PERCENTAGENS DE CONFIANÇA
+            if combined_result["products"] and VALIDATION_AVAILABLE and self.universal_validator:
+                try:
+                    logger.info("🔍 Iniciando validação universal com pontuação de confiança...")
+                    
+                    validation_result = await self.universal_validator.validate_products_with_confidence(
+                        combined_result["products"], 
+                        self.processed_images
+                    )
+                    
+                    # Substituir produtos pelos validados com pontuações
+                    combined_result["products"] = validation_result["validated_products"]
+                    combined_result["_universal_validation"] = validation_result["validation_report"]
+                    
+                    # Log de resultados
+                    avg_confidence = validation_result["validation_report"]["summary"]["average_confidence"]
+                    logger.info(f"✅ Validação concluída: confiança média {avg_confidence}")
+                    
+                except Exception as e:
+                    logger.error(f"Erro na validação universal: {str(e)}")
+                    combined_result["_universal_validation"] = {"error": str(e)}
+            
+            # VERIFICAÇÃO DE DADOS CONTRA PDF ORIGINAL
+            if combined_result["products"] and VALIDATION_AVAILABLE and self.data_verifier and self.processed_images:
+                try:
+                    logger.info("🔍 Iniciando verificação de dados contra PDF original...")
+                    
+                    verification_result = await self.data_verifier.verify_extracted_data(
+                        combined_result["products"],
+                        self.processed_images,
+                        self.current_context_info
+                    )
+                    
+                    combined_result["_data_verification"] = verification_result
+                    
+                    # Log de resultados
+                    if verification_result.get("summary"):
+                        avg_accuracy = verification_result["summary"]["verification_overview"]["average_accuracy"]
+                        logger.info(f"✅ Verificação concluída: precisão média {avg_accuracy}")
+                    
+                except Exception as e:
+                    logger.error(f"Erro na verificação de dados: {str(e)}")
+                    combined_result["_data_verification"] = {"error": str(e)}
+            
+            #################################################################################3
+
             # Pós-processamento (mantém-se igual)
             processed_products, determined_supplier = self._post_process_products(combined_result["products"], context_info)
             combined_result["order_info"]["supplier"] = determined_supplier

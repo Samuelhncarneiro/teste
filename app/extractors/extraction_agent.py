@@ -158,7 +158,7 @@ class ExtractionAgent:
         Analise esta página e extraia todas as informações de produtos presentes, seguindo todas as orientações de layout e estrutura descritas acima.
         
         Para cada produto, extraia:
-        - Nome do produto
+        - Nome do produto: Em português, se possível faz tradução
         - **Código do material**: Identificar por padrões acima OU campo específico detectado        
         - Categoria do produto - DEVE ser traduzido para PORTUGUÊS, usando APENAS uma das seguintes categorias: {CATEGORIES}
         - Modelo
@@ -228,7 +228,7 @@ class ExtractionAgent:
         Analise esta página e extraia todas as informações de produtos presentes, seguindo todas as orientações de layout e estrutura descritas acima.
         
         Para cada produto, extraia:
-        - Nome do produto
+        - Nome do produto: Em português, se possível faz tradução
         - **Código do material**: Identificar por padrões acima OU campo específico detectado        
         - Categoria do produto - DEVE ser traduzido para PORTUGUÊS, usando APENAS uma das seguintes categorias: {CATEGORIES}
         - Modelo
