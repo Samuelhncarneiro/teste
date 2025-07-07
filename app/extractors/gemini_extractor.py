@@ -22,9 +22,7 @@ from app.data.reference_data import (get_supplier_code, get_markup, get_category
 from app.utils.json_utils import safe_json_dump, fix_nan_in_products, sanitize_for_json
 from app.utils.supplier_assignment import determine_best_supplier, assign_supplier_to_products
 
-from app.extractors.product_recovery_agent import ProductRecoveryAgent
-from app.utils.extraction_monitor import ExtractionMonitor
-from app.utils.product_validator import ProductValidator
+logger = logging.getLogger(__name__)
 
 try:
     from app.utils.json_utils import safe_json_dump, fix_nan_in_products, sanitize_for_json
@@ -32,8 +30,6 @@ try:
 except ImportError:
     has_json_utils = False
     logger.warning("Módulo json_utils não encontrado, usar serialização padrão")
-
-logger = logging.getLogger(__name__)
 
 class GeminiExtractor(BaseExtractor):
     def __init__(self, api_key: str = GEMINI_API_KEY):
@@ -44,10 +40,6 @@ class GeminiExtractor(BaseExtractor):
         
         self.layout_detector = LayoutDetetionAgent(api_key)
         self.strategy_agent = GenericStrategyAgent()
-
-        self.product_recovery = ProductRecoveryAgent(api_key)
-        self.monitor = ExtractionMonitor()
-        self.validator = ProductValidator()
 
         self.current_layout_analysis = {}
         self.current_strategy = None
@@ -167,6 +159,7 @@ class GeminiExtractor(BaseExtractor):
             image_path, context, page_number, total_pages, previous_result
         )
         
+        # NOVA: Armazenar resultado para adaptação
         page_result["_strategy_used"] = self.current_strategy.name if self.current_strategy else "unknown"
         self.page_results_history.append(page_result)
         
@@ -204,12 +197,18 @@ class GeminiExtractor(BaseExtractor):
         
         return context + strategy_update
 
-    async def extract_document(self, document_path: str, job_id: str, jobs_store: Dict[str, Any], update_progress_callback) -> Dict[str, Any]:
+    async def extract_document(
+        self, 
+        document_path: str,
+        job_id: str,
+        jobs_store: Dict[str, Any],
+        update_progress_callback: Callable
+    ) -> Dict[str, Any]:
 
         start_time = time.time()
         
         try:
-            logger.info(f"🚀 INICIANDO EXTRAÇÃO - Job: {job_id}")
+            logger.info(f"🚀 INICIANDO EXTRAÇÃO - Job: {job_id}")  # ADICIONAR
             
             jobs_store[job_id]["model_results"]["gemini"] = {
                 "model_name": GEMINI_MODEL,
@@ -217,10 +216,11 @@ class GeminiExtractor(BaseExtractor):
                 "progress": 5.0
             }
             
+            # ETAPA 1: Análise melhorada (contexto + layout + estratégia)
             is_pdf = document_path.lower().endswith('.pdf')
             
             if is_pdf:
-                logger.info(f"📄 Processando PDF: {document_path}") 
+                logger.info(f"📄 Processando PDF: {document_path}")  # ADICIONAR
                 
                 jobs_store[job_id]["model_results"]["gemini"]["progress"] = 10.0
                 logger.info(f"=== ANÁLISE GENÉRICA INICIADA ===")
@@ -273,69 +273,45 @@ class GeminiExtractor(BaseExtractor):
             progress_per_page = 80.0 / total_pages
             
             for page_num, img_path in enumerate(image_paths, start=1):
+                logger.info(f"📄 Processando página {page_num}/{total_pages}: {os.path.basename(img_path)}")  # ADICIONAR
+                
                 current_progress = 15.0 + (page_num - 1) * progress_per_page
                 jobs_store[job_id]["model_results"]["gemini"]["progress"] = current_progress
                 
-                # CORREÇÃO 1: Registrar início da página no monitor
-                current_strategy_name = self.current_strategy.name if self.current_strategy else "unknown"
-                self.monitor.record_page_start(page_num, current_strategy_name)
-                
-                # CORREÇÃO 2: Processamento com recuperação automática
-                page_result = await self._process_page_with_recovery(
-                    img_path, context_description, page_num, total_pages, combined_result
+                # NOVA: Processamento com adaptação automática
+                logger.info(f"🔍 Enviando página {page_num} para análise IA...")  # ADICIONAR
+                page_result = await self.process_page(
+                    img_path,
+                    context_description,
+                    page_num,
+                    total_pages,
+                    combined_result if page_num > 1 else None
                 )
+                logger.info(f"✅ Página {page_num} processada")  # ADICIONAR
                 
-                # CORREÇÃO 3: Registrar resultado no monitor
-                final_strategy = self.current_strategy.name if self.current_strategy else "unknown"
-                self.monitor.record_page_result(page_num, page_result, final_strategy)
+                # Verificar erro (mantém-se igual)
+                if "error" in page_result and not page_result.get("products"):
+                    logger.error(f"❌ Erro ao processar página {page_num}: {page_result['error']}")
+                    if page_num == 1:
+                        raise ValueError(f"Falha ao processar a primeira página: {page_result['error']}")
+                    continue
                 
-                # Verificar mudança de estratégia
-                if current_strategy_name != final_strategy:
-                    self.monitor.record_strategy_change(current_strategy_name, final_strategy, page_num)
+                # Mesclar resultados (mantém-se igual)
+                if "products" in page_result:
+                    products_found = len(page_result.get("products", []))
+                    logger.info(f"📦 Página {page_num}: {products_found} produtos encontrados")  # ADICIONAR
+                    combined_result["products"].extend(page_result.get("products", []))
                 
-                # Processar resultado da página
-                if "error" not in page_result and page_result.get("products"):
-                    # CORREÇÃO 4: Validar produtos antes de adicionar
-                    valid_products = self._validate_extracted_products(page_result["products"], page_num)
-                    combined_result["products"].extend(valid_products)
-                    
-                    # Mesclar order_info
-                    if "order_info" in page_result and page_result["order_info"]:
-                        for key, value in page_result["order_info"].items():
-                            if value and (key not in combined_result["order_info"] or not combined_result["order_info"].get(key)):
-                                combined_result["order_info"][key] = value
+                if "order_info" in page_result and page_result["order_info"]:
+                    for key, value in page_result["order_info"].items():
+                        if value and (key not in combined_result["order_info"] or not combined_result["order_info"].get(key)):
+                            combined_result["order_info"][key] = value
                 
                 jobs_store[job_id]["model_results"]["gemini"]["progress"] = 15.0 + page_num * progress_per_page
             
-            await self._run_product_recovery(image_paths, combined_result)
-            
-
             total_products = len(combined_result["products"])
             logger.info(f"🎉 EXTRAÇÃO CONCLUÍDA - Total de produtos: {total_products}")
             
-            logger.info("=== INICIANDO RECUPERAÇÃO DE PRODUTOS PERDIDOS ===")
-            
-            total_recovered = 0
-            for page_num, img_path in enumerate(image_paths, start=1):
-                page_products = []
-                if page_num <= len(self.page_results_history):
-                    page_result = self.page_results_history[page_num - 1]
-                    page_products = page_result.get("products", [])
-                
-                # Tentar recuperar produtos perdidos
-                recovered_products = await self.product_recovery.recover_missing_products(
-                    img_path, page_products, page_num
-                )
-                
-                if recovered_products:
-                    # Adicionar produtos recuperados ao resultado
-                    combined_result["products"].extend(recovered_products)
-                    total_recovered += len(recovered_products)
-                    logger.info(f"Página {page_num}: {len(recovered_products)} produtos recuperados")
-            
-            if total_recovered > 0:
-                logger.info(f"RECUPERAÇÃO CONCLUÍDA: {total_recovered} produtos adicionais recuperados")
-
             if combined_result["products"]:
                 try:
                     mapped_products = self.ai_color_mapping_agent.map_product_colors(
@@ -355,7 +331,7 @@ class GeminiExtractor(BaseExtractor):
                 except Exception as e:
                     logger.error(f"Erro no mapeamento AI de cores: {str(e)}")
                     combined_result["_ai_color_mapping"] = {"error": str(e)}
-
+            
             # Pós-processamento (mantém-se igual)
             processed_products, determined_supplier = self._post_process_products(combined_result["products"], context_info)
             combined_result["order_info"]["supplier"] = determined_supplier
@@ -440,21 +416,15 @@ class GeminiExtractor(BaseExtractor):
             
             update_progress_callback(job_id)
             
-            processing_time = time.time() - start_time
-            self.monitor.finalize_monitoring(processing_time)
-
+            rocessing_time = time.time() - start_time
             logger.info(f"⏱️ Tempo total de processamento: {processing_time:.2f}s")  
             logger.info(f"📊 Taxa de produtos por segundo: {total_products/processing_time:.2f}")
-
-            detailed_report = self.monitor.get_detailed_report()
-            combined_result["_metadata"]["monitoring_report"] = detailed_report
 
             return combined_result
                 
         except Exception as e:
             error_message = f"Erro durante o processamento: {str(e)}"
-            logger.exception(f"ERRO DETALHADO: {str(e)}") 
-
+            
             jobs_store[job_id]["model_results"]["gemini"] = {
                 "model_name": GEMINI_MODEL,
                 "status": "failed",
@@ -467,105 +437,6 @@ class GeminiExtractor(BaseExtractor):
             
             return {"error": error_message}
     
-    async def _process_page_with_recovery(self, img_path: str, context: str, page_num: int, total_pages: int, combined_result: Dict[str, Any]) -> Dict[str, Any]:
-
-        try:
-            # Tentar processamento normal
-            page_result = await self.process_page(
-                img_path, context, page_num, total_pages, 
-                combined_result if page_num > 1 else None
-            )
-            
-            # Se teve erro de JSON, tentar recuperação específica
-            if "error" in page_result and "JSON" in page_result.get("error", ""):
-                logger.warning(f"Página {page_num}: Erro JSON detectado, tentando recuperação...")
-                
-                # Usar agente de recuperação
-                recovery_result = await self.product_recovery.recover_missing_products(
-                    img_path, [], page_num  # Lista vazia para forçar busca completa
-                )
-                
-                if recovery_result:
-                    logger.info(f"Página {page_num}: Recuperação bem-sucedida - {len(recovery_result)} produtos")
-                    self.monitor.record_recovery_attempt(page_num, len(recovery_result))
-                    return {"products": recovery_result, "order_info": {}}
-            
-            return page_result
-            
-        except Exception as e:
-            logger.error(f"Página {page_num}: Erro crítico - {str(e)}")
-            return {"error": str(e), "products": []}
-
-    def _validate_extracted_products(self, products: List[Dict[str, Any]], page_num: int) -> List[Dict[str, Any]]:
-        """
-        NOVO: Validação rigorosa de produtos extraídos
-        """
-        valid_products = []
-        invalid_count = 0
-        
-        for product in products:
-            is_valid, errors = self.validator.validate_product(product)
-            
-            if is_valid:
-                valid_products.append(product)
-            else:
-                invalid_count += 1
-                material_code = product.get("material_code", "N/A")
-                logger.warning(f"Página {page_num}: Produto inválido '{material_code}' - {errors[:2]}")  # Mostrar apenas primeiros 2 erros
-        
-        if invalid_count > 0:
-            logger.info(f"Página {page_num}: {len(valid_products)} produtos válidos, {invalid_count} rejeitados")
-        
-        return valid_products
-    
-    async def _run_product_recovery(self, image_paths: List[str], combined_result: Dict[str, Any]):
-        logger.info("=== INICIANDO RECUPERAÇÃO DE PRODUTOS PERDIDOS ===")
-        
-        # Obter produtos já extraídos
-        extracted_codes = set()
-        for product in combined_result["products"]:
-            code = product.get("material_code", "")
-            if code:
-                extracted_codes.add(code)
-        
-        # Verificar se faltam produtos conhecidos
-        expected_products = self.monitor.stats.expected_products
-        missing_products = expected_products - extracted_codes
-        
-        if not missing_products:
-            logger.info("✅ Todos os produtos esperados foram encontrados")
-            return
-        
-        logger.info(f"🔍 Tentando recuperar {len(missing_products)} produtos: {sorted(missing_products)}")
-        
-        total_recovered = 0
-        for page_num, img_path in enumerate(image_paths, start=1):
-            # Tentar recuperar produtos perdidos desta página
-            page_products = []
-            if page_num <= len(self.page_results_history):
-                page_result = self.page_results_history[page_num - 1]
-                page_products = page_result.get("products", [])
-            
-            recovered_products = await self.product_recovery.recover_missing_products(
-                img_path, page_products, page_num
-            )
-            
-            if recovered_products:
-                # Validar produtos recuperados
-                valid_recovered = self._validate_extracted_products(recovered_products, page_num)
-                
-                if valid_recovered:
-                    combined_result["products"].extend(valid_recovered)
-                    total_recovered += len(valid_recovered)
-                    self.monitor.record_recovery_attempt(page_num, len(valid_recovered))
-                    
-                    logger.info(f"Página {page_num}: {len(valid_recovered)} produtos recuperados com sucesso")
-        
-        if total_recovered > 0:
-            logger.info(f"🎉 RECUPERAÇÃO CONCLUÍDA: {total_recovered} produtos adicionais recuperados")
-        else:
-            logger.warning("⚠️ Nenhum produto adicional foi recuperado")
-
     def _post_process_products(self, products: List[Dict[str, Any]], context_info: Dict[str, Any]) -> List[Dict[str, Any]]:
         
         processed_products = []

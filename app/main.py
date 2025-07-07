@@ -3,14 +3,12 @@ import os
 import json
 import logging
 import time
-import math
 from typing import Optional, Dict, Any
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, BackgroundTasks, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 import pandas as pd
 from datetime import datetime
-from urllib.parse import unquote
 
 # Imports originais mantidos
 from app.config import (
@@ -19,13 +17,6 @@ from app.config import (
     CLEANUP_INTERVAL_HOURS, TEMP_RETENTION_HOURS, RESULTS_RETENTION_HOURS,
     LOG_FORMAT, LOG_LEVEL
 )
-
-try:
-    from app.utils.json_utils import safe_json_dump, fix_nan_in_products, sanitize_for_json
-    has_json_utils = True
-except ImportError:
-    has_json_utils = False
-    logger.warning("Módulo json_utils não encontrado, usar serialização padrão")
 
 from app.models.schemas import JobStatus
 from app.services.job_service import JobService
@@ -430,10 +421,8 @@ async def get_job_status(job_id: str):
     - **job_id**: ID do job
     """
     logger.info(f"🔍 Consultando status do job: {job_id}")
-
-    job_id = unquote(job_id)
+    
     job = job_service.get_job(job_id)
-
     if not job:
         raise HTTPException(
             status_code=404, 
@@ -456,8 +445,12 @@ async def get_job_status(job_id: str):
 
 @app.get("/job/{job_id}/excel", summary="Obter resultado em Excel")
 async def get_job_excel(job_id: str, season: str = None):
-
-    job_id = unquote(job_id)
+    """
+    📊 Retorna os resultados do job em formato Excel.
+    
+    - **job_id**: ID do job
+    - **season**: Temporada (opcional, ex: "FW23")
+    """
     job = job_service.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job não encontrado")
@@ -466,9 +459,7 @@ async def get_job_excel(job_id: str, season: str = None):
         raise HTTPException(status_code=400, detail="Job ainda em processamento")
     
     # Verificar se temos resultados
-    if "gemini" not in job.get("model_results", {}) or "result" not in job.get("model_results", {}).get("gemini", {}):
-        logger.warning(f"Job {job_id} não tem resultados gemini disponíveis. Status: {job.get('status')}")
-        logger.warning(f"Model results keys: {list(job.get('model_results', {}).keys())}")
+    if "gemini" not in job["model_results"] or "result" not in job["model_results"]["gemini"]:
         raise HTTPException(status_code=404, detail="Resultados não disponíveis")
     
     try:
@@ -496,6 +487,11 @@ async def get_job_excel(job_id: str, season: str = None):
 
 @app.get("/job/{job_id}/json", summary="Obter resultado em JSON")
 async def get_job_json(job_id: str):
+    """
+    📋 Retorna os resultados do job em formato JSON.
+    
+    - **job_id**: ID do job
+    """
     job = job_service.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job não encontrado")
@@ -506,39 +502,8 @@ async def get_job_json(job_id: str):
     if "gemini" not in job["model_results"] or "result" not in job["model_results"]["gemini"]:
         raise HTTPException(status_code=404, detail="Resultados não disponíveis")
     
-    try:
-        extraction_result = job["model_results"]["gemini"]["result"]
-        
-        if has_json_utils:
-            try:
-                from app.utils.recovery_system import ProcessingRecovery
-                extraction_result = ProcessingRecovery.fix_extraction_result(extraction_result)
-            except ImportError:
-                pass
-        
-        def sanitize_datetime(obj):
-            import datetime
-            if isinstance(obj, dict):
-                return {k: sanitize_datetime(v) for k, v in obj.items()}
-            elif isinstance(obj, list):
-                return [sanitize_datetime(item) for item in obj]
-            elif isinstance(obj, datetime.datetime):
-                return obj.isoformat()
-            elif isinstance(obj, datetime.date):
-                return obj.isoformat()
-            elif isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
-                return None
-            else:
-                return obj
-        
-        extraction_result = sanitize_datetime(extraction_result)
-        
-        return JSONResponse(content=extraction_result, status_code=200)
-        
-    except Exception as e:
-        logger.exception(f"Erro ao gerar JSON: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Erro ao gerar JSON: {str(e)}")
-
+    extraction_result = job["model_results"]["gemini"]["result"]
+    return JSONResponse(content=extraction_result, status_code=200)
 
 @app.get("/jobs", summary="Listar todos os jobs")
 async def list_jobs():

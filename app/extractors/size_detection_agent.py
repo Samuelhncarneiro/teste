@@ -1,226 +1,275 @@
-# app/extractors/size_detection_agent.py - VERSÃO CORRIGIDA
+# app/extractors/size_detection_agent.py
 
-import logging
-from typing import Dict, Any, List, Optional, Set
 import re
+import logging
+from typing import Dict, Any, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
 class SizeDetectionAgent:
     def __init__(self):
-        # CORREÇÃO: Sistema de tamanhos mais específico para LIUJO
-        self.size_systems = {
+        self.size_patterns = {
             'clothing_numeric_eu': {
-                'sizes': ['34', '36', '38', '40', '42', '44', '46', '48', '50', '52', '54', '56'],
-                'categories': ['VESTIDOS', 'BLUSAS', 'SAIAS', 'CASACOS', 'CAMISAS'],
-                'priority': 1
+                'sizes': ['32', '34', '36', '38', '40', '42', '44', '46', '48', '50', '52', '54', '56', '58'],
+                'categories': ['VESTIDOS', 'BLUSAS', 'SAIAS', 'CASACOS', 'BLAZERS E FATOS'],
+                'pattern': r'^(3[2-9]|4[0-9]|5[0-8])$'
             },
             'clothing_letters': {
-                'sizes': ['XS', 'S', 'M', 'L', 'XL', 'XXL', 'XXXL'],
+                'sizes': ['XS', 'S', 'M', 'L', 'XL', 'XXL', 'XXXL', '2XL', '3XL'],
                 'categories': ['T-SHIRTS', 'MALHAS', 'SWEATSHIRTS', 'POLOS'],
-                'priority': 2
+                'pattern': r'^(XS|S|M|L|XL|XXL|XXXL|2XL|3XL)$'
             },
             'pants_numeric': {
-                'sizes': ['24', '25', '26', '27', '28', '29', '30', '31', '32', '33', '34', '35'],
+                'sizes': ['24', '25', '26', '27', '28', '29', '30', '31', '32', '33', '34', '35', '36'],
                 'categories': ['CALÇAS', 'JEANS'],
-                'priority': 3
+                'pattern': r'^(2[4-9]|3[0-6])$'
             },
-            'combined_sizes': {
+            'mixed_sizes': {
                 'sizes': ['38/XS', '40/S', '42/M', '44/L', '46/XL', '48/XXL'],
-                'categories': [],  # Aplicável a todas
-                'priority': 4
-            },
-            'children_sizes': {
-                'sizes': ['2', '4', '6', '8', '10', '12', '14', '16'],
-                'categories': ['INFANTIL'],
-                'priority': 5
-            },
-            'universal_size': {
-                'sizes': ['TU', 'UNICA', 'ÚNICO', 'ONE SIZE'],
-                'categories': ['ACESSÓRIOS'],
-                'priority': 6
+                'categories': ['UNIVERSAL'],
+                'pattern': r'^(38/XS|40/S|42/M|44/L|46/XL|48/XXL)$'
             }
         }
-        
-        # CORREÇÃO: Mapeamento de limpeza de tamanhos
-        self.size_normalization = {
-            'EXTRA SMALL': 'XS',
-            'SMALL': 'S',
-            'MEDIUM': 'M',
-            'LARGE': 'L',
-            'EXTRA LARGE': 'XL',
-            'XX LARGE': 'XXL',
-            '2XL': 'XXL',
-            '3XL': 'XXXL',
-            'XXX LARGE': 'XXXL',
-        }
-        
-        # CORREÇÃO: Tamanhos inválidos que devem ser ignorados
-        self.invalid_sizes = {
-            'QTY', 'PRICE', 'TOTAL', 'SUBTOTAL', 
-            'COLOR', 'MODEL', 'CODE', 'NAME',
-            'EUR', 'USD', '$', '€', '%',
-            'PCES', 'PCS', 'PIECES',
-            'NULL', 'NONE', 'N/A', '-', '_', '.',
-            # Números que não são tamanhos
-            '1', '11', '111', '0', '00'
-        }
     
-    def normalize_size_extraction(self, extracted_sizes: List[Dict], category: str = None) -> List[Dict]:
+    def detect_size_system(self, sizes_list: List[str]) -> str:
         """
-        CORREÇÃO: Normalização mais rigorosa com validação por sistema
+        Detecta qual sistema de tamanhos está sendo usado
         """
-        if not extracted_sizes:
-            return []
+        if not sizes_list:
+            return 'unknown'
         
-        # Identificar sistema de tamanhos mais provável
-        detected_systems = self._detect_size_systems(extracted_sizes, category)
+        # Limpar e normalizar tamanhos
+        clean_sizes = [self._normalize_size(size) for size in sizes_list if size and size.strip()]
         
-        normalized = []
-        invalid_count = 0
-        
-        for size_info in extracted_sizes:
-            cleaned_size = self._clean_and_validate_size(size_info, detected_systems)
-            if cleaned_size:
-                normalized.append(cleaned_size)
-            else:
-                invalid_count += 1
-        
-        if invalid_count > 0:
-            logger.debug(f"Sistema de tamanhos: {[s for s in detected_systems.keys()]}, "
-                        f"Válidos: {len(normalized)}, Inválidos: {invalid_count}")
-        
-        return normalized
-    
-    def _detect_size_systems(self, extracted_sizes: List[Dict], category: str = None) -> Dict[str, float]:
-        """
-        CORREÇÃO: Detecção automática do sistema de tamanhos usado
-        """
+        # Contar matches para cada sistema
         system_scores = {}
         
-        # Extrair tamanhos únicos
-        unique_sizes = set()
-        for size_info in extracted_sizes:
-            size = str(size_info.get('size', '')).strip().upper()
-            if size:
-                unique_sizes.add(size)
+        for system_name, system_info in self.size_patterns.items():
+            score = 0
+            total_sizes = len(clean_sizes)
+            
+            for size in clean_sizes:
+                if re.match(system_info['pattern'], size):
+                    score += 1
+            
+            if total_sizes > 0:
+                system_scores[system_name] = score / total_sizes
         
-        # Calcular scores para cada sistema
-        for system_name, system_info in self.size_systems.items():
-            score = 0.0
-            system_sizes = set(system_info['sizes'])
-            
-            # Score baseado na correspondência de tamanhos
-            matching_sizes = unique_sizes.intersection(system_sizes)
-            if system_sizes:
-                size_match_ratio = len(matching_sizes) / len(system_sizes)
-                score += size_match_ratio * 0.7
-            
-            # Score baseado na categoria
-            if category and system_info['categories']:
-                if category in system_info['categories']:
-                    score += 0.3
-            
-            # Bonus para sistemas prioritários se houver correspondência
-            if score > 0:
-                priority_bonus = (6 - system_info['priority']) * 0.05
-                score += priority_bonus
-            
-            system_scores[system_name] = score
-            
-            if score > 0:
-                logger.info(f"Sistema de tamanhos detectado: {system_name} (score: {score:.2f})")
+        # Retornar o sistema com maior score
+        if system_scores:
+            best_system = max(system_scores, key=system_scores.get)
+            if system_scores[best_system] > 0.6:  # Pelo menos 60% de match
+                logger.info(f"Sistema de tamanhos detectado: {best_system} (score: {system_scores[best_system]:.2f})")
+                return best_system
         
-        # Retornar apenas sistemas com score > 0
-        return {k: v for k, v in system_scores.items() if v > 0}
+        return 'unknown'
     
-    def _clean_and_validate_size(self, size_info: Dict, detected_systems: Dict[str, float]) -> Optional[Dict]:
+    def _normalize_size(self, size: str) -> str:
         """
-        CORREÇÃO: Limpeza e validação rigorosa de tamanho individual
-        """
-        if not isinstance(size_info, dict):
-            return None
-        
-        size = str(size_info.get('size', '')).strip().upper()
-        quantity = size_info.get('quantity', 0)
-        
-        # 1. Limpeza básica do tamanho
-        size = self._normalize_size_string(size)
-        
-        # 2. Verificar se é tamanho inválido
-        if not size or size in self.invalid_sizes:
-            return None
-        
-        # 3. Validar quantidade
-        try:
-            qty_num = float(quantity) if quantity is not None else 0
-            if qty_num <= 0:
-                return None
-            # Converter para int se for número inteiro
-            if qty_num.is_integer():
-                qty_num = int(qty_num)
-        except (ValueError, TypeError):
-            return None
-        
-        # 4. Validar tamanho contra sistemas detectados
-        if not self._is_size_valid_for_systems(size, detected_systems):
-            logger.debug(f"Tamanho '{size}' não válido para sistemas detectados")
-            return None
-        
-        return {
-            'size': size,
-            'quantity': qty_num
-        }
-    
-    def _normalize_size_string(self, size: str) -> str:
-        """
-        CORREÇÃO: Normalização específica de strings de tamanho
+        Normaliza um tamanho para comparação
         """
         if not size:
             return ""
         
-        # Remover caracteres especiais
-        size = re.sub(r'[^\w\s/]', '', size)
-        size = size.strip().upper()
+        # Remover espaços e converter para uppercase
+        normalized = str(size).strip().upper()
         
-        # Aplicar mapeamento de normalização
-        if size in self.size_normalization:
-            size = self.size_normalization[size]
+        # Remover zeros à esquerda para tamanhos numéricos
+        if normalized.isdigit():
+            normalized = str(int(normalized))
         
-        # Tratar tamanhos numéricos - remover zeros à esquerda
-        if size.isdigit():
-            size = str(int(size))
-        
-        # Tratar casos especiais
-        if size.startswith('0') and len(size) > 1 and size[1:].isdigit():
-            size = str(int(size))  # Remove zeros à esquerda
-        
-        return size
+        return normalized
     
-    def _is_size_valid_for_systems(self, size: str, detected_systems: Dict[str, float]) -> bool:
+    def validate_size_quantity_mapping(
+        self, 
+        size_quantity_pairs: List[Dict[str, Any]], 
+        category: str = None
+    ) -> List[Dict[str, Any]]:
         """
-        CORREÇÃO: Validação específica contra sistemas detectados
+        Valida e corrige o mapeamento entre tamanhos e quantidades
         """
-        if not detected_systems:
-            # Se não detectou sistema específico, usar validação geral
-            return self._is_generally_valid_size(size)
+        if not size_quantity_pairs:
+            return []
         
-        # Verificar se o tamanho é válido em pelo menos um sistema detectado
-        for system_name, score in detected_systems.items():
-            if score > 0:  # Sistema foi detectado
-                system_info = self.size_systems[system_name]
-                if size in system_info['sizes']:
-                    return True
+        # Detectar sistema de tamanhos
+        sizes = [pair.get('size', '') for pair in size_quantity_pairs]
+        detected_system = self.detect_size_system(sizes)
+        
+        validated_pairs = []
+        
+        for pair in size_quantity_pairs:
+            size = self._normalize_size(pair.get('size', ''))
+            quantity = pair.get('quantity', 0)
+            
+            # Validar se é um tamanho válido
+            if self._is_valid_size_for_system(size, detected_system):
+                # Validar quantidade
+                try:
+                    qty_num = float(quantity) if quantity is not None else 0
+                    if qty_num > 0:
+                        validated_pairs.append({
+                            'size': size,
+                            'quantity': int(qty_num) if qty_num.is_integer() else qty_num
+                        })
+                except (ValueError, TypeError):
+                    logger.warning(f"Quantidade inválida para tamanho {size}: {quantity}")
+                    continue
+            else:
+                logger.warning(f"Tamanho inválido para sistema {detected_system}: {size}")
+        
+        return validated_pairs
+    
+    def _is_valid_size_for_system(self, size: str, system: str) -> bool:
+        """
+        Verifica se um tamanho é válido para um sistema específico
+        """
+        if system == 'unknown':
+            # Se não conseguimos detectar o sistema, aceitar tamanhos comuns
+            all_valid_sizes = []
+            for pattern_info in self.size_patterns.values():
+                all_valid_sizes.extend(pattern_info['sizes'])
+            return size in all_valid_sizes
+        
+        if system in self.size_patterns:
+            pattern = self.size_patterns[system]['pattern']
+            return bool(re.match(pattern, size))
         
         return False
     
-    def _is_generally_valid_size(self, size: str) -> bool:
+    def extract_sizes_from_table_row(
+        self, 
+        headers: List[str], 
+        quantities: List[Any]
+    ) -> List[Dict[str, Any]]:
         """
-        CORREÇÃO: Validação geral para quando não há sistema específico detectado
+        Extrai tamanhos e quantidades de uma linha de tabela com base nos cabeçalhos
         """
-        # Consolidar todos os tamanhos válidos
-        all_valid_sizes = set()
-        for system_info in self.size_systems.values():
-            all_valid_sizes.update(system_info['sizes'])
+        if len(headers) != len(quantities):
+            logger.warning(f"Número de cabeçalhos ({len(headers)}) não coincide com quantidades ({len(quantities)})")
+            return []
         
-        return size in all_valid_sizes
+        size_quantity_pairs = []
+        
+        for i, (header, quantity) in enumerate(zip(headers, quantities)):
+            # Tentar extrair tamanho do cabeçalho
+            potential_size = self._extract_size_from_header(header)
+            
+            if potential_size:
+                try:
+                    qty_num = float(quantity) if quantity not in [None, '', 0, '0'] else 0
+                    if qty_num > 0:
+                        size_quantity_pairs.append({
+                            'size': potential_size,
+                            'quantity': int(qty_num) if qty_num.is_integer() else qty_num
+                        })
+                except (ValueError, TypeError):
+                    continue
+        
+        # Validar o mapeamento
+        return self.validate_size_quantity_mapping(size_quantity_pairs)
+    
+    def _extract_size_from_header(self, header: str) -> Optional[str]:
+        """
+        Extrai o tamanho de um cabeçalho de coluna
+        """
+        if not header:
+            return None
+        
+        header_clean = str(header).strip().upper()
+        
+        # Padrões para extrair tamanhos de cabeçalhos
+        size_patterns = [
+            r'^(XS|S|M|L|XL|XXL|XXXL|2XL|3XL)$',  # Tamanhos por letra
+            r'^(3[2-9]|4[0-9]|5[0-8])$',  # Tamanhos numéricos europeus
+            r'^(2[4-9]|3[0-6])$',  # Tamanhos de calças
+            r'(38/XS|40/S|42/M|44/L|46/XL|48/XXL)',  # Tamanhos mistos
+            r'(\d{2})',  # Qualquer número de 2 dígitos
+        ]
+        
+        for pattern in size_patterns:
+            match = re.search(pattern, header_clean)
+            if match:
+                return match.group(1)
+        
+        return None
+    
+    def normalize_size_extraction(
+        self, 
+        extracted_sizes: List[Dict], 
+        category: str = None
+    ) -> List[Dict]:
+        """
+        Normaliza uma extração de tamanhos, garantindo consistência
+        """
+        if not extracted_sizes:
+            return []
+        
+        # Primeiro, validar o mapeamento
+        validated_sizes = self.validate_size_quantity_mapping(extracted_sizes, category)
+        
+        # Ordenar por tamanho (se possível)
+        try:
+            validated_sizes.sort(key=lambda x: self._get_size_sort_key(x['size']))
+        except:
+            pass  # Se não conseguir ordenar, manter ordem original
+        
+        return validated_sizes
+    
+    def _get_size_sort_key(self, size: str) -> Tuple:
+        """
+        Gera uma chave para ordenação de tamanhos
+        """
+        # Ordem para tamanhos por letra
+        letter_order = {'XS': 1, 'S': 2, 'M': 3, 'L': 4, 'XL': 5, 'XXL': 6, 'XXXL': 7, '2XL': 5, '3XL': 7}
+        
+        if size in letter_order:
+            return (0, letter_order[size])
+        
+        # Para tamanhos numéricos
+        if size.isdigit():
+            return (1, int(size))
+        
+        # Para tamanhos mistos (38/XS)
+        if '/' in size:
+            parts = size.split('/')
+            if parts[0].isdigit():
+                return (2, int(parts[0]))
+        
+        # Fallback: ordenação alfabética
+        return (3, size)
+    
+    def debug_size_extraction(self, headers: List[str], quantities: List[Any]) -> Dict[str, Any]:
+        """
+        Função de debug para entender problemas na extração de tamanhos
+        """
+        debug_info = {
+            'headers': headers,
+            'quantities': quantities,
+            'header_quantity_pairs': list(zip(headers, quantities)),
+            'detected_sizes': [],
+            'valid_pairs': [],
+            'issues': []
+        }
+        
+        # Analisar cada cabeçalho
+        for i, header in enumerate(headers):
+            potential_size = self._extract_size_from_header(header)
+            debug_info['detected_sizes'].append({
+                'index': i,
+                'header': header,
+                'detected_size': potential_size,
+                'quantity': quantities[i] if i < len(quantities) else None
+            })
+        
+        # Extrair pares válidos
+        valid_pairs = self.extract_sizes_from_table_row(headers, quantities)
+        debug_info['valid_pairs'] = valid_pairs
+        
+        # Identificar problemas
+        if len(headers) != len(quantities):
+            debug_info['issues'].append(f"Mismatch: {len(headers)} headers vs {len(quantities)} quantities")
+        
+        if not valid_pairs:
+            debug_info['issues'].append("Nenhum par tamanho-quantidade válido encontrado")
+        
+        return debug_info
