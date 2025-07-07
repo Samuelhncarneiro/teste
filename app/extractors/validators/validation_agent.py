@@ -1,4 +1,5 @@
-# app/extractors/validation_agent.py
+# app/extractors/validation_agent.py (VERSÃO MELHORADA)
+
 import asyncio
 import json
 import logging
@@ -27,9 +28,14 @@ class ValidationResult:
     visual_completeness_score: float
     density_score: float
     recommendations: List[str]
+    # NOVOS CAMPOS ESPECÍFICOS
+    sizes_corrected: int
+    quantities_corrected: int
+    products_merged: int
+    corrections_applied: List[str]
 
 class ValidationAgent:
-    """Agent responsável por validar e corrigir extrações de produtos"""
+    """Agent responsável por validar e corrigir extrações de produtos com foco em problemas específicos"""
     
     def __init__(self, api_key: str = GEMINI_API_KEY):
         self.api_key = api_key
@@ -42,227 +48,408 @@ class ValidationAgent:
                                 pdf_pages: List[Image.Image],
                                 layout_analysis: Dict = None) -> ValidationResult:
         """
-        Valida a extração e tenta corrigir problemas identificados
-        
-        Args:
-            extracted_products: Lista de produtos extraídos
-            original_context: Contexto original do documento
-            pdf_pages: Lista de imagens das páginas do PDF
-            layout_analysis: Análise de layout do documento
-            
-        Returns:
-            ValidationResult: Resultado completo da validação
+        Valida a extração com foco em problemas específicos:
+        1. Tamanhos incompletos ou incorretos
+        2. Quantidades todas iguais a 1
+        3. Produtos duplicados por cor
+        4. Alinhamento incorreto de colunas
         """
-        logger.info("Iniciando validação da extração...")
+        logger.info("🔍 Iniciando validação específica...")
         
         validation_errors = []
         missing_fields = []
         recommendations = []
+        corrections_applied = []
+        sizes_corrected = 0
+        quantities_corrected = 0
+        products_merged = 0
         
-        # 1. Validar estrutura dos produtos
-        for i, product in enumerate(extracted_products):
-            if not self._validate_product_structure(product):
-                validation_errors.append(f"Produto {i+1}: Estrutura inválida")
-            
-            # Verificar campos obrigatórios
-            required_fields = ['product_name', 'material_code', 'colors']
-            for field in required_fields:
-                if not product.get(field):
-                    missing_fields.append(f"Produto {i+1}: Campo '{field}' em falta")
-        
-        # 2. Calcular métricas de qualidade
-        completeness_score = self._calculate_completeness_score(extracted_products)
-        consistency_score = self._calculate_consistency_score(extracted_products)
-        visual_completeness_score = await self._analyze_visual_completeness(
-            extracted_products, pdf_pages, original_context
+        # 1. CORREÇÃO ESPECÍFICA: Agrupar produtos por cor
+        logger.info("🎨 Verificando agrupamento de produtos por cor...")
+        color_grouped_products, merge_corrections = await self._fix_color_grouping(
+            extracted_products, pdf_pages
         )
-        density_score = self._calculate_density_score(extracted_products, original_context)
+        corrections_applied.extend(merge_corrections)
+        products_merged = len(extracted_products) - len(color_grouped_products)
         
-        # 3. Calcular score de confiança global
+        # 2. CORREÇÃO ESPECÍFICA: Tamanhos e quantidades
+        logger.info("📏 Corrigindo tamanhos e quantidades...")
+        size_corrected_products, size_corrections = await self._fix_sizes_and_quantities(
+            color_grouped_products, pdf_pages
+        )
+        corrections_applied.extend(size_corrections)
+        sizes_corrected = len([c for c in size_corrections if 'tamanho' in c.lower()])
+        quantities_corrected = len([c for c in size_corrections if 'quantidade' in c.lower()])
+        
+        # 3. Validações originais
+        completeness_score = self._calculate_completeness_score(size_corrected_products)
+        consistency_score = self._calculate_consistency_score(size_corrected_products)
+        visual_completeness_score = await self._analyze_visual_completeness(
+            size_corrected_products, pdf_pages, original_context
+        )
+        density_score = self._calculate_density_score(size_corrected_products, original_context)
+        
         confidence_score = self._calculate_overall_confidence(
             completeness_score, consistency_score, visual_completeness_score, density_score
         )
         
-        logger.info(f"Scores de validação - Completude: {completeness_score:.2f}, "
-                   f"Consistência: {consistency_score:.2f}, "
-                   f"Visual: {visual_completeness_score:.2f}, "
-                   f"Densidade: {density_score:.2f}")
-        
-        # 4. Gerar recomendações
-        recommendations = self._generate_recommendations(
-            completeness_score, consistency_score, visual_completeness_score, 
-            density_score, validation_errors, missing_fields
+        # 4. Gerar recomendações específicas
+        recommendations = self._generate_specific_recommendations(
+            extracted_products, size_corrected_products, corrections_applied
         )
         
-        # 5. Tentar correção se confiança baixa
-        corrected_products = extracted_products
-        extraction_method = "original"
-        
-        if confidence_score < 0.7:
-            logger.warning(f"Confiança baixa ({confidence_score:.2f}), tentando correção...")
-            corrected_products = await self._attempt_correction(
-                extracted_products, original_context, pdf_pages, layout_analysis
-            )
-            
-            # Recalcular métricas após correção
-            completeness_score = self._calculate_completeness_score(corrected_products)
-            consistency_score = self._calculate_consistency_score(corrected_products)
-            visual_completeness_score = await self._analyze_visual_completeness(
-                corrected_products, pdf_pages, original_context
-            )
-            density_score = self._calculate_density_score(corrected_products, original_context)
-            
-            confidence_score = self._calculate_overall_confidence(
-                completeness_score, consistency_score, visual_completeness_score, density_score
-            )
-            
-            extraction_method = "corrected"
-            logger.info(f"Após correção - Nova confiança: {confidence_score:.2f}")
+        logger.info(f"✅ Validação concluída:")
+        logger.info(f"   - Produtos originais: {len(extracted_products)}")
+        logger.info(f"   - Produtos finais: {len(size_corrected_products)}")
+        logger.info(f"   - Produtos agrupados: {products_merged}")
+        logger.info(f"   - Tamanhos corrigidos: {sizes_corrected}")
+        logger.info(f"   - Quantidades corrigidas: {quantities_corrected}")
+        logger.info(f"   - Confiança: {confidence_score:.2f}")
         
         return ValidationResult(
-            products=corrected_products,
+            products=size_corrected_products,
             confidence_score=confidence_score,
             missing_fields=missing_fields,
             validation_errors=validation_errors,
             total_pages_processed=len(pdf_pages),
-            extraction_method=extraction_method,
+            extraction_method="corrected",
             completeness_score=completeness_score,
             consistency_score=consistency_score,
             visual_completeness_score=visual_completeness_score,
             density_score=density_score,
-            recommendations=recommendations
+            recommendations=recommendations,
+            sizes_corrected=sizes_corrected,
+            quantities_corrected=quantities_corrected,
+            products_merged=products_merged,
+            corrections_applied=corrections_applied
         )
     
-    def _validate_product_structure(self, product: Dict) -> bool:
-        """Valida se o produto tem estrutura mínima necessária"""
-        if not isinstance(product, dict):
-            return False
+    async def _fix_color_grouping(self, 
+                                products: List[Dict], 
+                                images: List[Image.Image]) -> Tuple[List[Dict], List[str]]:
+        """
+        Corrige agrupamento de produtos por cor (ex: CF5271MA96E.1 e CF5271MA96E.2)
+        """
+        corrections = []
         
-        # Verificar campos essenciais
-        if not product.get('product_name') or not product.get('colors'):
-            return False
+        # Agrupar por código base
+        product_groups = {}
+        for product in products:
+            material_code = product.get('material_code', '')
+            base_code = re.sub(r'\.\d+$', '', material_code)  # Remove .1, .2, etc.
+            
+            if base_code not in product_groups:
+                product_groups[base_code] = []
+            product_groups[base_code].append(product)
         
-        # Verificar estrutura das cores
-        colors = product.get('colors', [])
-        if not isinstance(colors, list) or len(colors) == 0:
-            return False
+        merged_products = []
         
-        for color in colors:
-            if not isinstance(color, dict):
-                return False
-            if not color.get('sizes') or not isinstance(color.get('sizes'), list):
-                return False
+        for base_code, group in product_groups.items():
+            if len(group) == 1:
+                merged_products.append(group[0])
+            else:
+                # Verificar se devem ser agrupados
+                merged = await self._merge_product_variants(base_code, group, images)
+                if merged:
+                    merged_products.append(merged)
+                    corrections.append(f"Agrupadas {len(group)} variantes de {base_code} por cor")
+                else:
+                    merged_products.extend(group)
         
-        return True
+        return merged_products, corrections
     
+    async def _merge_product_variants(self, 
+                                    base_code: str, 
+                                    variants: List[Dict],
+                                    images: List[Image.Image]) -> Optional[Dict]:
+        """
+        Faz merge de variantes de produto por cor
+        """
+        try:
+            if not images or len(variants) < 2:
+                return None
+            
+            # Extrair todas as cores das variantes
+            all_colors = []
+            base_product = variants[0].copy()
+            
+            for variant in variants:
+                variant_colors = variant.get('colors', [])
+                all_colors.extend(variant_colors)
+            
+            # Verificar visualmente se é mesmo o mesmo produto
+            merge_prompt = f"""
+            VERIFICAÇÃO DE AGRUPAMENTO - {base_code}
+            
+            Encontradas {len(variants)} variantes com códigos similares:
+            {[v.get('material_code') for v in variants]}
+            
+            Analise a imagem e determine se estas variantes representam o MESMO produto com cores diferentes.
+            
+            Critérios para AGRUPAR:
+            1. Mesmo nome de produto
+            2. Mesmo formato/tipo de item
+            3. Apenas cores diferentes
+            4. Código base idêntico
+            
+            Responda apenas: "AGRUPAR" ou "SEPARAR"
+            """
+            
+            response = self.model.generate_content([merge_prompt, images[0]])
+            
+            if "AGRUPAR" in response.text.upper():
+                # Fazer merge
+                merged_product = base_product
+                merged_product['material_code'] = base_code
+                merged_product['colors'] = all_colors
+                
+                logger.info(f"✅ Agrupando {len(variants)} variantes de {base_code}")
+                return merged_product
+            
+            return None
+            
+        except Exception as e:
+            logger.warning(f"Erro no merge de {base_code}: {e}")
+            return None
+    
+    async def _fix_sizes_and_quantities(self, 
+                                       products: List[Dict],
+                                       images: List[Image.Image]) -> Tuple[List[Dict], List[str]]:
+        """
+        Corrige tamanhos incompletos e quantidades incorretas
+        """
+        corrections = []
+        corrected_products = []
+        
+        for product in products:
+            material_code = product.get('material_code', '')
+            logger.debug(f"🔍 Validando tamanhos/quantidades: {material_code}")
+            
+            corrected_product, product_corrections = await self._fix_single_product(
+                product, images
+            )
+            
+            corrected_products.append(corrected_product)
+            corrections.extend(product_corrections)
+        
+        return corrected_products, corrections
+    
+    async def _fix_single_product(self, 
+                                product: Dict,
+                                images: List[Image.Image]) -> Tuple[Dict, List[str]]:
+        """
+        Corrige um produto específico analisando a imagem
+        """
+        corrections = []
+        material_code = product.get('material_code', '')
+        
+        try:
+            if not images:
+                return product, corrections
+            
+            # Análise específica para este produto
+            fix_prompt = f"""
+            CORREÇÃO ESPECÍFICA DE PRODUTO - {material_code}
+            
+            Produto atual:
+            {json.dumps(product, indent=2)}
+            
+            PROBLEMAS A VERIFICAR:
+            1. TAMANHOS INCOMPLETOS: Faltam XS ou XL que estão visíveis?
+            2. QUANTIDADES INCORRETAS: Todas as quantidades são 1 quando deveriam ser diferentes?
+            3. ALINHAMENTO: Os tamanhos correspondem às colunas corretas?
+            
+            TAREFA:
+            1. Localize este código ({material_code}) na imagem
+            2. Leia TODOS os tamanhos da linha (XS, S, M, L, XL, etc.)
+            3. Leia as quantidades EXATAS (incluindo 0 para tamanhos sem stock)
+            4. Verifique o alinhamento posicional
+            
+            RESPOSTA EM JSON:
+            {{
+                "needs_correction": true/false,
+                "corrections": {{
+                    "material_code": "{material_code}",
+                    "colors": [
+                        {{
+                            "color_code": "código_da_cor",
+                            "color_name": "nome_da_cor",
+                            "unit_price": 0.0,
+                            "sizes": [
+                                {{"size": "XS", "quantity": 0}},
+                                {{"size": "S", "quantity": 1}},
+                                {{"size": "M", "quantity": 1}},
+                                {{"size": "L", "quantity": 1}},
+                                {{"size": "XL", "quantity": 0}}
+                            ]
+                        }}
+                    ]
+                }},
+                "changes_made": [
+                    "Lista de mudanças específicas feitas"
+                ]
+            }}
+            
+            IMPORTANTE: 
+            - Incluir TODOS os tamanhos visíveis (mesmo quantidade 0)
+            - Ler quantidades EXATAS da imagem
+            - Só corrigir se tiver certeza
+            """
+            
+            # Tentar com múltiplas imagens
+            for image in images:
+                try:
+                    response = self.model.generate_content([fix_prompt, image])
+                    analysis = self._extract_json_safely(response.text)
+                    
+                    if analysis and analysis.get('needs_correction'):
+                        corrections_data = analysis.get('corrections', {})
+                        changes_made = analysis.get('changes_made', [])
+                        
+                        if corrections_data and changes_made:
+                            # Aplicar correções
+                            corrected_product = product.copy()
+                            corrected_product.update(corrections_data)
+                            
+                            for change in changes_made:
+                                corrections.append(f"{material_code}: {change}")
+                                logger.info(f"🔧 {material_code}: {change}")
+                            
+                            return corrected_product, corrections
+                    
+                except Exception as e:
+                    logger.warning(f"Erro ao analisar {material_code} na imagem: {e}")
+                    continue
+            
+            return product, corrections
+            
+        except Exception as e:
+            logger.warning(f"Erro na correção de {material_code}: {e}")
+            return product, corrections
+    
+    def _generate_specific_recommendations(self, 
+                                         original: List[Dict],
+                                         corrected: List[Dict],
+                                         corrections: List[str]) -> List[str]:
+        """
+        Gera recomendações específicas baseadas nas correções aplicadas
+        """
+        recommendations = []
+        
+        # Analisar produtos agrupados
+        if len(corrected) < len(original):
+            merged_count = len(original) - len(corrected)
+            recommendations.append(f"Agrupados {merged_count} produtos duplicados por cor")
+        
+        # Analisar tipos de correções
+        size_corrections = [c for c in corrections if 'tamanho' in c.lower()]
+        quantity_corrections = [c for c in corrections if 'quantidade' in c.lower()]
+        
+        if size_corrections:
+            recommendations.append(f"Corrigidos tamanhos em {len(size_corrections)} produtos")
+        
+        if quantity_corrections:
+            recommendations.append(f"Corrigidas quantidades em {len(quantity_corrections)} produtos")
+        
+        # Verificar se ainda há problemas
+        uniform_quantities = 0
+        for product in corrected:
+            for color in product.get('colors', []):
+                sizes = color.get('sizes', [])
+                quantities = [s.get('quantity', 0) for s in sizes]
+                if len(set(quantities)) == 1 and quantities[0] == 1:
+                    uniform_quantities += 1
+        
+        if uniform_quantities > 0:
+            recommendations.append(f"ATENÇÃO: {uniform_quantities} cores ainda têm quantidades uniformes (possível erro)")
+        
+        if not recommendations:
+            recommendations.append("Extração parece estar correta - sem correções necessárias")
+        
+        return recommendations
+    
+    # Métodos auxiliares originais (mantidos)
     def _calculate_completeness_score(self, products: List[Dict]) -> float:
-        """Calcula score de completude dos dados"""
         if not products:
             return 0.0
-        
         complete_products = sum(1 for p in products if self._is_product_complete(p))
         return complete_products / len(products)
     
     def _is_product_complete(self, product: Dict) -> bool:
-        """Verifica se um produto tem todos os campos importantes"""
         required_fields = ['product_name', 'material_code', 'colors']
-        
         for field in required_fields:
             if not product.get(field):
                 return False
         
-        # Verificar se cores têm tamanhos e quantidades
         colors = product.get('colors', [])
         for color in colors:
             sizes = color.get('sizes', [])
             if not sizes:
                 return False
-            
-            # Pelo menos um tamanho deve ter quantidade
             has_quantity = any(s.get('quantity', 0) > 0 for s in sizes)
             if not has_quantity:
                 return False
-        
         return True
     
     def _calculate_consistency_score(self, products: List[Dict]) -> float:
-        """Verifica consistência dos códigos e estruturas"""
         if not products:
             return 0.0
-        
-        # Analisar padrões de códigos
         codes = [p.get('material_code', '') for p in products if p.get('material_code')]
         if not codes:
             return 0.0
         
-        # Verificar se códigos seguem padrão similar
         pattern_matches = 0
         for code in codes:
-            # Padrões comuns: CF5015E0624, 251204, T3216, etc.
-            if (re.match(r'^[A-Z]{2}\d{3,4}[A-Z]*\d*$', code) or  # CF5015E0624
-                re.match(r'^\d{6,}$', code) or                      # 251204
-                re.match(r'^[A-Z]\d{4}$', code)):                   # T3216
+            if (re.match(r'^[A-Z]{2}\d{3,4}[A-Z]*\d*$', code) or
+                re.match(r'^\d{6,}$', code) or
+                re.match(r'^[A-Z]\d{4}$', code)):
                 pattern_matches += 1
         
         return pattern_matches / len(codes) if codes else 0.0
     
-    async def _analyze_visual_completeness(self, 
-                                         products: List[Dict], 
+    async def _analyze_visual_completeness(self, products: List[Dict], 
                                          pages: List[Image.Image],
                                          context: Dict) -> float:
-        """Analisa visualmente se há produtos não capturados"""
         if not pages:
-            return 0.5  # Score neutro se não há páginas
+            return 0.5
         
         try:
-            # Análise visual da primeira página como referência
             prompt = f"""
-            Analise esta imagem de documento comercial e faça uma avaliação:
+            Analise esta imagem e avalie a qualidade da extração:
             
-            1. Quantos produtos/itens únicos você consegue identificar visualmente?
-            2. Há tabelas ou seções que parecem conter produtos não processados?
-            3. Existem linhas de produtos que parecem incompletas ou cortadas?
-            4. A densidade de produtos na imagem condiz com o número extraído?
+            Produtos extraídos: {len(products)}
             
-            Informações do contexto:
-            - Tipo de documento: {context.get('document_type', 'N/A')}
-            - Fornecedor: {context.get('supplier', 'N/A')}
-            - Produtos extraídos: {len(products)}
+            1. Todos os produtos visíveis foram capturados?
+            2. Os tamanhos parecem completos (XS, S, M, L, XL)?
+            3. As quantidades parecem variadas (não todas iguais a 1)?
             
-            Responda APENAS com um número decimal entre 0.0 e 1.0 indicando a completude:
-            - 1.0: Todos os produtos visíveis foram capturados adequadamente
-            - 0.8: A maioria foi capturada, algumas omissões menores
-            - 0.6: Aproximadamente metade foi capturada adequadamente
-            - 0.4: Muitos produtos visíveis parecem não ter sido capturados
-            - 0.0: A maioria dos produtos visíveis não foi capturada
+            Responda com score 0.0-1.0:
+            - 1.0: Extração parece completa e precisa
+            - 0.8: Boa qualidade, pequenos problemas
+            - 0.6: Qualidade média
+            - 0.4: Problemas significativos
+            - 0.0: Muitos problemas
             
-            Resposta (apenas o número decimal):
+            Resposta (apenas número):
             """
             
             response = self.model.generate_content([prompt, pages[0]])
             score_text = response.text.strip()
-            
-            # Extrair número da resposta
             score_match = re.search(r'(\d*\.?\d+)', score_text)
             
             if score_match:
-                score = float(score_match.group(1))
-                return min(1.0, max(0.0, score))
-            
-            return 0.5  # Score neutro se não conseguir analisar
+                return min(1.0, max(0.0, float(score_match.group(1))))
+            return 0.5
             
         except Exception as e:
             logger.warning(f"Erro na análise visual: {e}")
             return 0.5
     
     def _calculate_density_score(self, products: List[Dict], context: Dict) -> float:
-        """Calcula densidade de informação baseada no contexto"""
         if not products:
             return 0.0
         
-        # Estimar densidade baseada no tipo de documento
         doc_type = context.get('document_type', '').lower()
-        
         expected_density = {
             'nota de encomenda': 0.8,
             'pedido': 0.7,
@@ -272,19 +459,16 @@ class ValidationAgent:
         
         base_density = expected_density.get(doc_type, 0.7)
         
-        # Calcular densidade real
         complete_fields = 0
         total_fields = 0
         
         for product in products:
-            # Campos por produto
             product_fields = ['product_name', 'material_code', 'category', 'brand']
             for field in product_fields:
                 total_fields += 1
                 if product.get(field):
                     complete_fields += 1
             
-            # Campos por cor
             colors = product.get('colors', [])
             for color in colors:
                 color_fields = ['color_code', 'color_name', 'unit_price']
@@ -293,13 +477,12 @@ class ValidationAgent:
                     if color.get(field):
                         complete_fields += 1
                 
-                # Tamanhos
                 sizes = color.get('sizes', [])
                 for size in sizes:
                     size_fields = ['size', 'quantity']
                     for field in size_fields:
                         total_fields += 1
-                        if size.get(field):
+                        if size.get(field) is not None:  # Importante: aceitar 0
                             complete_fields += 1
         
         actual_density = complete_fields / total_fields if total_fields > 0 else 0.0
@@ -309,7 +492,6 @@ class ValidationAgent:
     
     def _calculate_overall_confidence(self, completeness: float, consistency: float, 
                                     visual: float, density: float) -> float:
-        """Calcula score de confiança global ponderado"""
         weights = {
             'completeness': 0.3,
             'consistency': 0.2,
@@ -324,127 +506,18 @@ class ValidationAgent:
         
         return overall
     
-    def _generate_recommendations(self, completeness: float, consistency: float,
-                                visual: float, density: float, 
-                                errors: List[str], missing: List[str]) -> List[str]:
-        """Gera recomendações baseadas nas métricas"""
-        recommendations = []
-        
-        if completeness < 0.6:
-            recommendations.append("Produtos com dados incompletos - verificar campos obrigatórios")
-        
-        if consistency < 0.5:
-            recommendations.append("Inconsistência nos códigos de produto - verificar padrões")
-        
-        if visual < 0.6:
-            recommendations.append("Possíveis produtos não extraídos - verificar visualmente o documento")
-        
-        if density < 0.5:
-            recommendations.append("Baixa densidade de informação - pode haver campos não capturados")
-        
-        if len(errors) > len(missing):
-            recommendations.append("Muitos erros de estrutura - considerar ajustar estratégia de extração")
-        
-        if not recommendations:
-            recommendations.append("Extração com boa qualidade - proceder com confiança")
-        
-        return recommendations
-    
-    async def _attempt_correction(self, 
-                                products: List[Dict], 
-                                context: Dict,
-                                pages: List[Image.Image],
-                                layout_analysis: Dict = None) -> List[Dict]:
-        """Tenta corrigir problemas identificados na extração"""
-        corrected_products = products.copy()
-        
+    def _extract_json_safely(self, text: str) -> Optional[Dict]:
         try:
-            # Estratégia de correção baseada no layout
-            layout_info = layout_analysis or {}
-            layout_type = layout_info.get('layout_type', 'UNKNOWN')
-            
-            correction_prompt = f"""
-            CORREÇÃO ESPECIALIZADA DE EXTRAÇÃO DE PRODUTOS
-            
-            A extração inicial pode ter perdido produtos ou dados. Analise esta imagem com foco em:
-            
-            1. Produtos que podem ter sido perdidos completamente
-            2. Campos de produtos existentes que podem estar vazios
-            3. Códigos de produto isolados sem dados associados
-            4. Tamanhos/cores que podem não ter sido mapeados corretamente
-            
-            CONTEXTO DO DOCUMENTO:
-            - Tipo: {context.get('document_type', 'N/A')}
-            - Fornecedor: {context.get('supplier', 'N/A')}
-            - Layout detectado: {layout_type}
-            - Produtos já extraídos: {len(products)}
-            
-            ESTRATÉGIA DE CORREÇÃO:
-            - Foque em áreas que podem ter sido negligenciadas
-            - Procure padrões de dados não capturados
-            - Identifique produtos com estrutura incompleta
-            
-            Se encontrar produtos adicionais ou correções, retorne em formato JSON:
-            {{
-                "additional_products": [...],
-                "corrections": [
-                    {{
-                        "product_index": 0,
-                        "field": "campo_a_corrigir",
-                        "corrected_value": "valor_corrigido"
-                    }}
-                ]
-            }}
-            
-            Se não encontrar melhorias, retorne:
-            {{"additional_products": [], "corrections": []}}
-            """
-            
-            response = self.model.generate_content([correction_prompt, pages[0]])
-            
-            # Extrair correções
-            correction_data = self._extract_json_from_text(response.text)
-            
-            if correction_data:
-                # Aplicar produtos adicionais
-                additional_products = correction_data.get('additional_products', [])
-                if additional_products:
-                    logger.info(f"Adicionando {len(additional_products)} produtos encontrados na correção")
-                    corrected_products.extend(additional_products)
-                
-                # Aplicar correções
-                corrections = correction_data.get('corrections', [])
-                for correction in corrections:
-                    try:
-                        idx = correction.get('product_index', -1)
-                        field = correction.get('field', '')
-                        value = correction.get('corrected_value', '')
-                        
-                        if 0 <= idx < len(corrected_products) and field and value:
-                            corrected_products[idx][field] = value
-                            logger.info(f"Correção aplicada ao produto {idx}: {field} = {value}")
-                    except Exception as e:
-                        logger.warning(f"Erro ao aplicar correção: {e}")
-            
-        except Exception as e:
-            logger.warning(f"Erro na tentativa de correção: {e}")
-        
-        return corrected_products
-    
-    def _extract_json_from_text(self, text: str) -> Dict:
-        """Extrai JSON do texto de resposta"""
-        try:
-            # Procurar por JSON com markdown
-            json_match = re.search(r'```json\s*(\{.*?\})\s*```', text, re.DOTALL)
+            json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
             if json_match:
                 return json.loads(json_match.group(1))
             
-            # Procurar por JSON sem markdown
             json_match = re.search(r'(\{.*\})', text, re.DOTALL)
             if json_match:
                 return json.loads(json_match.group(1))
             
-            return {}
+            return None
+            
         except Exception as e:
             logger.warning(f"Erro ao extrair JSON: {e}")
-            return {}
+            return None

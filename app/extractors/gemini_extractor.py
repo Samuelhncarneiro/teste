@@ -16,6 +16,7 @@ from app.extractors.extraction_agent import ExtractionAgent
 from app.extractors.color_mapping_agent import ColorMappingAgent
 from app.extractors.layout_detetion_agent import LayoutDetetionAgent
 from app.extractors.generic_strategy_agent import GenericStrategyAgent
+from app.extractors.validators.size_color_validation_agent import SizeColorValidationAgent, SizeColorValidationResult
 from app.extractors.validators.validation_agent import ValidationAgent, ValidationResult
 
 from app.utils.file_utils import convert_pdf_to_images
@@ -27,7 +28,13 @@ from app.utils.supplier_assignment import determine_best_supplier, assign_suppli
 logger = logging.getLogger(__name__)
 
 try:
-    from app.extractors.validators.size_color_validation_agent import SizeColorValidationAgent, SizeColorValidationResult
+    HAS_VALIDATION = True
+    logger.info("✅ Sistema de validação melhorado carregado")
+except ImportError:
+    HAS_VALIDATION = False
+    logger.warning("⚠️ Sistema de validação não disponível")
+
+try:
     HAS_SIZE_VALIDATION = True
     logger.info("✅ Sistema de validação de tamanhos carregado")
 except ImportError:
@@ -52,6 +59,7 @@ class GeminiExtractor(BaseExtractor):
         self.strategy_agent = GenericStrategyAgent()
 
         self.validation_agent = ValidationAgent(api_key)
+        
         if HAS_SIZE_VALIDATION:
             try:
                 self.size_validator = SizeColorValidationAgent(api_key)
@@ -95,6 +103,325 @@ class GeminiExtractor(BaseExtractor):
         
         return enhanced_context
 
+    async def _retry_extraction_with_different_strategy(self, 
+                                                   document_path: str,
+                                                   recommendations: List[str]) -> List[Dict]:
+        try:
+            logger.info("🔄 Tentando re-extração com estratégia alternativa...")
+            
+            # Analisar recomendações para escolher estratégia
+            retry_focus = []
+            
+            if any("tamanho" in rec.lower() for rec in recommendations):
+                retry_focus.append("sizes")
+            if any("quantidade" in rec.lower() for rec in recommendations):
+                retry_focus.append("quantities")
+            if any("agrup" in rec.lower() for rec in recommendations):
+                retry_focus.append("grouping")
+            
+            # Executar re-extração focada
+            if "sizes" in retry_focus or "quantities" in retry_focus:
+                return await self._focused_size_quantity_extraction(document_path)
+            elif "grouping" in retry_focus:
+                return await self._focused_grouping_extraction(document_path)
+            else:
+                return await self._generic_retry_extraction(document_path)
+                
+        except Exception as e:
+            logger.warning(f"Erro na re-extração: {e}")
+            return []
+
+    async def _focused_size_quantity_extraction(self, document_path: str) -> List[Dict]:
+        """
+        Re-extração focada em tamanhos e quantidades corretos
+        """
+        try:
+            images = self._get_document_images_safe(document_path)
+            if not images:
+                return []
+            
+            context = self.current_context_info or {}
+            
+            # Prompt especializado em tamanhos e quantidades
+            focused_prompt = f"""
+            RE-EXTRAÇÃO FOCADA EM TAMANHOS E QUANTIDADES
+            
+            PROBLEMA DETECTADO: Tamanhos incompletos ou quantidades incorretas
+            
+            INSTRUÇÕES ESPECÍFICAS:
+            1. Para cada produto, leia TODOS os tamanhos da linha (XS, S, M, L, XL, XXL)
+            2. Leia as quantidades EXATAS de cada tamanho (incluindo 0)
+            3. NÃO assuma quantidade 1 para todos
+            4. Verifique alinhamento posicional entre colunas
+            
+            FORMATO DE RESPOSTA:
+            {{
+                "products": [
+                    {{
+                        "product_name": "...",
+                        "material_code": "...",
+                        "colors": [
+                            {{
+                                "color_code": "...",
+                                "color_name": "...",
+                                "unit_price": 0.0,
+                                "sizes": [
+                                    {{"size": "XS", "quantity": 0}},
+                                    {{"size": "S", "quantity": 1}},
+                                    {{"size": "M", "quantity": 2}},
+                                    {{"size": "L", "quantity": 1}},
+                                    {{"size": "XL", "quantity": 0}}
+                                ]
+                            }}
+                        ]
+                    }}
+                ]
+            }}
+            
+            CRÍTICO: Incluir TODOS os tamanhos visíveis, mesmo com quantidade 0
+            """
+            
+            result = await self.extraction_agent.extract_from_page(
+                images[0], focused_prompt, 1, len(images), []
+            )
+            
+            return result.get('products', [])
+            
+        except Exception as e:
+            logger.warning(f"Erro na re-extração focada: {e}")
+            return []
+
+    async def _focused_grouping_extraction(self, document_path: str) -> List[Dict]:
+        """
+        Re-extração focada em agrupamento correto de produtos
+        """
+        try:
+            images = self._get_document_images_safe(document_path)
+            if not images:
+                return []
+            
+            grouping_prompt = f"""
+            RE-EXTRAÇÃO FOCADA EM AGRUPAMENTO DE PRODUTOS
+            
+            PROBLEMA DETECTADO: Produtos duplicados por cor
+            
+            INSTRUÇÕES:
+            1. Identifique produtos com códigos similares (ex: CF5271MA96E.1, CF5271MA96E.2)
+            2. Agrupe-os em UM produto com múltiplas cores
+            3. NÃO crie produtos separados para cada cor
+            
+            EXEMPLO CORRETO:
+            {{
+                "products": [
+                    {{
+                        "material_code": "CF5271MA96E",
+                        "product_name": "Malha Gola Redonda",
+                        "colors": [
+                            {{
+                                "color_code": "M9799",
+                                "color_name": "Nero",
+                                "sizes": [...tamanhos para esta cor...]
+                            }},
+                            {{
+                                "color_code": "012",
+                                "color_name": "Bege", 
+                                "sizes": [...tamanhos para esta cor...]
+                            }}
+                        ]
+                    }}
+                ]
+            }}
+            """
+            
+            result = await self.extraction_agent.extract_from_page(
+                images[0], grouping_prompt, 1, len(images), []
+            )
+            
+            return result.get('products', [])
+            
+        except Exception as e:
+            logger.warning(f"Erro na re-extração de agrupamento: {e}")
+            return []
+
+    async def _generic_retry_extraction(self, document_path: str) -> List[Dict]:
+        """
+        Re-extração genérica com prompt mais rigoroso
+        """
+        try:
+            images = self._get_document_images_safe(document_path)
+            if not images:
+                return []
+            
+            context = self.current_context_info.copy() if self.current_context_info else {}
+            context.update({
+                'extraction_mode': 'retry_conservative',
+                'focus': 'accuracy_over_speed',
+                'validation': 'strict'
+            })
+            
+            result = await self.extraction_agent.extract_from_page(
+                images[0], context, 1, len(images), []
+            )
+            
+            return result.get('products', [])
+            
+        except Exception as e:
+            logger.warning(f"Erro no retry genérico: {e}")
+            return []
+    
+    async def extract_with_validation(self, document_path: str, 
+                                enable_validation: bool = True,
+                                max_retries: int = 1) -> Dict[str, Any]:
+
+        logger.info(f"🔍 Iniciando extração com validação MELHORADA para: {os.path.basename(document_path)}")
+        
+        try:
+            # 1. Extração inicial (método existente)
+            logger.info("🚀 Executando extração inicial...")
+            extraction_result = await self.extract(document_path)
+            initial_products = extraction_result.get('products', [])
+            
+            logger.info(f"📊 Extração inicial: {len(initial_products)} produtos")
+            
+            # 2. Se validação desabilitada ou não disponível
+            if not enable_validation or not HAS_VALIDATION or not self.validation_agent:
+                logger.info("📄 Executando sem validação")
+                extraction_result['validation'] = {
+                    'enabled': False,
+                    'message': 'Validação desabilitada ou não disponível'
+                }
+                return extraction_result
+            
+            # 3. Detectar páginas que falharam (método existente)
+            failed_pages = []
+            if hasattr(self, 'page_results_history'):
+                for i, page_result in enumerate(self.page_results_history):
+                    if page_result.get('error') or page_result.get('products_count', 0) == 0:
+                        failed_pages.append(i + 1)
+            
+            if failed_pages:
+                logger.info(f"🔍 Páginas com falha detectadas: {failed_pages}")
+            
+            # 4. Obter imagens para validação
+            images = self._get_document_images_safe(document_path)
+            if not images:
+                logger.warning("⚠️ Sem imagens para validação visual")
+                extraction_result['validation'] = {
+                    'enabled': False,
+                    'message': 'Sem imagens para análise visual'
+                }
+                return extraction_result
+            
+            logger.info(f"🖼️ Carregadas {len(images)} imagens para validação")
+            
+            # 5. Executar validação MELHORADA
+            logger.info("🔍 Executando validação com correções específicas...")
+            
+            context = {
+                'document_type': extraction_result.get('document_type', ''),
+                'supplier': extraction_result.get('supplier', ''),
+                'brand': extraction_result.get('brand', ''),
+                'file_name': os.path.basename(document_path)
+            }
+            
+            validation_result = await self.validation_agent.validate_extraction(
+                extracted_products=initial_products,
+                original_context=context,
+                pdf_pages=images,
+                layout_analysis=self.current_layout_analysis
+            )
+            
+            # 6. Log detalhado das correções
+            logger.info(f"📈 Validação concluída:")
+            logger.info(f"   - Produtos iniciais: {len(initial_products)}")
+            logger.info(f"   - Produtos finais: {len(validation_result.products)}")
+            logger.info(f"   - Produtos agrupados: {validation_result.products_merged}")
+            logger.info(f"   - Tamanhos corrigidos: {validation_result.sizes_corrected}")
+            logger.info(f"   - Quantidades corrigidas: {validation_result.quantities_corrected}")
+            logger.info(f"   - Confiança: {validation_result.confidence_score:.2f}")
+            
+            # 7. Log das correções aplicadas
+            if validation_result.corrections_applied:
+                logger.info("🔧 Correções aplicadas:")
+                for correction in validation_result.corrections_applied[:5]:
+                    logger.info(f"   - {correction}")
+                if len(validation_result.corrections_applied) > 5:
+                    logger.info(f"   - ... e mais {len(validation_result.corrections_applied) - 5}")
+            
+            # 8. Log das recomendações
+            if validation_result.recommendations:
+                logger.info("💡 Recomendações:")
+                for rec in validation_result.recommendations:
+                    logger.info(f"   - {rec}")
+            
+            # 9. Retry se confiança muito baixa
+            retry_count = 0
+            while (validation_result.confidence_score < 0.5 and 
+                retry_count < max_retries):
+                
+                retry_count += 1
+                logger.warning(f"Confiança baixa ({validation_result.confidence_score:.2f}) - Retry {retry_count}")
+                
+                # Re-extração com estratégia diferente (método existente)
+                alternative_products = await self._retry_extraction_with_different_strategy(
+                    document_path, validation_result.recommendations
+                )
+                
+                if alternative_products:
+                    validation_result = await self.validation_agent.validate_extraction(
+                        extracted_products=alternative_products,
+                        original_context=context,
+                        pdf_pages=images,
+                        layout_analysis=self.current_layout_analysis
+                    )
+            
+            # 10. Preparar resultado final melhorado
+            enhanced_result = extraction_result.copy()
+            enhanced_result.update({
+                'products': validation_result.products,
+                'validation': {
+                    'enabled': True,
+                    'confidence_score': validation_result.confidence_score,
+                    'completeness_score': validation_result.completeness_score,
+                    'consistency_score': validation_result.consistency_score,
+                    'visual_completeness_score': validation_result.visual_completeness_score,
+                    'density_score': validation_result.density_score,
+                    'extraction_method': validation_result.extraction_method,
+                    'validation_errors': validation_result.validation_errors,
+                    'missing_fields': validation_result.missing_fields,
+                    'recommendations': validation_result.recommendations,
+                    'total_pages_processed': validation_result.total_pages_processed,
+                    'products_initial': len(initial_products),
+                    'products_final': len(validation_result.products),
+                    'products_merged': validation_result.products_merged,
+                    'sizes_corrected': validation_result.sizes_corrected,
+                    'quantities_corrected': validation_result.quantities_corrected,
+                    'corrections_applied': validation_result.corrections_applied,
+                    'failed_pages_detected': failed_pages
+                }
+            })
+            
+            # 11. Status final
+            if validation_result.confidence_score >= 0.8:
+                logger.info(f"✅ EXCELENTE: Alta confiança ({validation_result.confidence_score:.2f})")
+            elif validation_result.confidence_score >= 0.6:
+                logger.info(f"⚠️ BOM: Confiança média ({validation_result.confidence_score:.2f})")
+            else:
+                logger.warning(f"❌ ATENÇÃO: Baixa confiança ({validation_result.confidence_score:.2f})")
+            
+            return enhanced_result
+            
+        except Exception as e:
+            logger.exception(f"❌ Erro na validação: {str(e)}")
+            
+            # Fallback para resultado original
+            extraction_result['validation'] = {
+                'enabled': False,
+                'error': str(e),
+                'message': 'Validação falhou - resultado da extração normal'
+            }
+            return extraction_result
+    
     def _analyze_improvements(self, 
                         initial_products: List[Dict], 
                         corrected_products: List[Dict]) -> List[str]:
@@ -154,15 +481,17 @@ class GeminiExtractor(BaseExtractor):
         return False
 
     def _get_document_images_safe(self, document_path: str) -> List[Image.Image]:
-        """Obter imagens do documento de forma segura"""
+        """Método melhorado para obter imagens"""
         try:
             if not document_path.lower().endswith('.pdf'):
+                logger.info("Documento não é PDF - validação visual limitada")
                 return []
             
-            # Usar método existente
+            # Usar método existente de conversão
             image_paths = convert_pdf_to_images(document_path, CONVERTED_DIR)
             
             if not image_paths:
+                logger.warning("Não foi possível converter PDF para imagens")
                 return []
             
             images = []
@@ -171,13 +500,13 @@ class GeminiExtractor(BaseExtractor):
                     img = Image.open(img_path)
                     images.append(img)
                 except Exception as e:
-                    logger.warning(f"⚠️ Erro ao carregar {img_path}: {e}")
+                    logger.warning(f"⚠️ Erro ao carregar imagem {img_path}: {e}")
             
-            logger.info(f"🖼️ Carregadas {len(images)} imagens")
+            logger.info(f"🖼️ Carregadas {len(images)} imagens para validação")
             return images
             
         except Exception as e:
-            logger.warning(f"⚠️ Erro ao obter imagens: {e}")
+            logger.warning(f"⚠️ Erro ao obter imagens do documento: {e}")
             return []
         
     async def extract_with_size_validation(self, document_path: str, confidence_threshold: float = 0.7) -> Dict[str, Any]:
