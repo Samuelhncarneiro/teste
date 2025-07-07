@@ -7,6 +7,7 @@ from typing import Dict, Any, List, Optional, Callable
 import re 
 import math
 import numpy as np
+from PIL import Image 
 
 from app.config import GEMINI_API_KEY, GEMINI_MODEL, CONVERTED_DIR
 from app.extractors.base import BaseExtractor
@@ -15,6 +16,7 @@ from app.extractors.extraction_agent import ExtractionAgent
 from app.extractors.color_mapping_agent import ColorMappingAgent
 from app.extractors.layout_detetion_agent import LayoutDetetionAgent
 from app.extractors.generic_strategy_agent import GenericStrategyAgent
+from app.extractors.validation_agent import ValidationAgent, ValidationResult
 
 from app.utils.file_utils import convert_pdf_to_images
 from app.utils.barcode_generator import add_barcodes_to_extraction_result, add_barcodes_to_products
@@ -40,6 +42,8 @@ class GeminiExtractor(BaseExtractor):
         
         self.layout_detector = LayoutDetetionAgent(api_key)
         self.strategy_agent = GenericStrategyAgent()
+
+        self.validation_agent = ValidationAgent(api_key)
 
         self.current_layout_analysis = {}
         self.current_strategy = None
@@ -74,6 +78,217 @@ class GeminiExtractor(BaseExtractor):
         
         return enhanced_context
     
+    async def extract_with_validation(self, document_path: str, 
+                                    enable_validation: bool = True,
+                                    max_retries: int = 1) -> Dict[str, Any]:    
+         
+        logger.info(f"Iniciando extração com validação para: {document_path}")
+        
+        try:
+            # 1. Extrair normalmente (usando método existente)
+            extraction_result = await self.extract(document_path)
+            products = extraction_result.get('products', [])
+            
+            # Se validação desabilitada, retornar resultado normal
+            if not enable_validation:
+                return extraction_result
+            
+            # 2. Preparar dados para validação
+            images = self._get_document_images(document_path)
+            context = {
+                'document_type': extraction_result.get('document_type', ''),
+                'supplier': extraction_result.get('supplier', ''),
+                'brand': extraction_result.get('brand', ''),
+                'file_name': os.path.basename(document_path)
+            }
+            
+            # 3. Executar validação
+            logger.info("Executando validação da extração...")
+            validation_result = await self.validation_agent.validate_extraction(
+                extracted_products=products,
+                original_context=context,
+                pdf_pages=images,
+                layout_analysis=self.current_layout_analysis
+            )
+            
+            # 4. Verificar se precisa de retry
+            retry_count = 0
+            while (validation_result.confidence_score < 0.6 and 
+                   retry_count < max_retries and 
+                   validation_result.extraction_method != "corrected"):
+                
+                retry_count += 1
+                logger.warning(f"Tentativa {retry_count + 1} devido à baixa confiança "
+                             f"({validation_result.confidence_score:.2f})")
+                
+                # Re-extrair com estratégia diferente se possível
+                products = await self._retry_extraction_with_different_strategy(
+                    document_path, validation_result.recommendations
+                )
+                
+                # Re-validar
+                validation_result = await self.validation_agent.validate_extraction(
+                    extracted_products=products,
+                    original_context=context,
+                    pdf_pages=images,
+                    layout_analysis=self.current_layout_analysis
+                )
+            
+            # 5. Preparar resultado final
+            enhanced_result = extraction_result.copy()
+            enhanced_result.update({
+                'products': validation_result.products,
+                'validation': {
+                    'confidence_score': validation_result.confidence_score,
+                    'completeness_score': validation_result.completeness_score,
+                    'consistency_score': validation_result.consistency_score,
+                    'visual_completeness_score': validation_result.visual_completeness_score,
+                    'density_score': validation_result.density_score,
+                    'extraction_method': validation_result.extraction_method,
+                    'validation_errors': validation_result.validation_errors,
+                    'missing_fields': validation_result.missing_fields,
+                    'recommendations': validation_result.recommendations,
+                    'total_pages_processed': validation_result.total_pages_processed
+                }
+            })
+            
+            logger.info(f"Extração finalizada - Confiança: {validation_result.confidence_score:.2f}, "
+                       f"Produtos: {len(validation_result.products)}")
+            
+            return enhanced_result
+            
+        except Exception as e:
+            logger.exception(f"Erro na extração com validação: {str(e)}")
+            return await self.extract(document_path)
+
+    def _get_document_images(self, document_path: str) -> List[Image.Image]:
+        try:
+            from app.utils.file_utils import convert_pdf_to_images
+            from PIL import Image
+            
+            # Converter PDF para imagens
+            image_paths = convert_pdf_to_images(document_path, CONVERTED_DIR)
+            
+            images = []
+            for img_path in image_paths:
+                try:
+                    img = Image.open(img_path)
+                    images.append(img)
+                except Exception as e:
+                    logger.warning(f"Erro ao carregar imagem {img_path}: {e}")
+            
+            return images
+            
+        except Exception as e:
+            logger.warning(f"Erro ao converter PDF para imagens: {e}")
+            return []
+    
+    async def _retry_extraction_with_different_strategy(self, 
+                                                       document_path: str,
+                                                       recommendations: List[str]) -> List[Dict]:
+        """
+        Tenta re-extração com estratégia alternativa baseada nas recomendações
+        """
+        try:
+            logger.info("Tentando estratégia alternativa de extração...")
+            
+            # Analisar recomendações para escolher estratégia
+            if any("visual" in rec.lower() for rec in recommendations):
+                # Se problema é visual, tentar extração mais conservadora
+                return await self._conservative_extraction(document_path)
+            elif any("estrutura" in rec.lower() for rec in recommendations):
+                # Se problema é estrutural, tentar abordagem diferente
+                return await self._alternative_structure_extraction(document_path)
+            else:
+                # Estratégia genérica de retry
+                return await self._generic_retry_extraction(document_path)
+                
+        except Exception as e:
+            logger.warning(f"Erro na re-extração: {e}")
+            return []
+    
+    async def _conservative_extraction(self, document_path: str) -> List[Dict]:
+        """Extração conservadora focada em dados de alta confiança"""
+        try:
+            # Usar apenas primeira página com análise detalhada
+            images = self._get_document_images(document_path)
+            if not images:
+                return []
+            
+            context = self.current_context_info or {}
+            
+            # Estratégia conservadora - extrair apenas dados claramente visíveis
+            conservative_result = await self.extraction_agent.extract_from_page(
+                images[0], context, 1, 1, []
+            )
+            
+            return conservative_result.get('products', [])
+            
+        except Exception as e:
+            logger.warning(f"Erro na extração conservadora: {e}")
+            return []
+
+    async def _alternative_structure_extraction(self, document_path: str) -> List[Dict]:
+        """Extração com abordagem estrutural alternativa"""
+        try:
+            # Forçar re-análise de layout com estratégia diferente
+            alternative_layout = await self.layout_detector.analyze_document_structure(document_path)
+            
+            # Selecionar estratégia diferente
+            alternative_strategy = self.strategy_agent.select_strategy(
+                layout_analysis=alternative_layout,
+                page_number=1,
+                previous_results=self.page_results_history
+            )
+            
+            if alternative_strategy.name != self.current_strategy.name:
+                logger.info(f"Usando estratégia alternativa: {alternative_strategy.name}")
+                
+                # Re-extrair com nova estratégia
+                images = self._get_document_images(document_path)
+                if images:
+                    enhanced_context = self._enhance_context_with_layout_and_strategy(
+                        self.current_context_info, alternative_layout, alternative_strategy
+                    )
+                    
+                    result = await self.extraction_agent.extract_from_page(
+                        images[0], enhanced_context, 1, len(images), []
+                    )
+                    
+                    return result.get('products', [])
+            
+            return []
+            
+        except Exception as e:
+            logger.warning(f"Erro na extração estrutural alternativa: {e}")
+            return []
+
+    async def _generic_retry_extraction(self, document_path: str) -> List[Dict]:
+        """Retry genérico com parâmetros ajustados"""
+        try:
+            # Extrair novamente mas com prompt modificado para ser mais rigoroso
+            images = self._get_document_images(document_path)
+            if not images:
+                return []
+            
+            # Criar contexto mais específico para retry
+            retry_context = self.current_context_info.copy() if self.current_context_info else {}
+            retry_context.update({
+                'extraction_mode': 'retry',
+                'focus': 'complete_products_only',
+                'strictness': 'high'
+            })
+            
+            result = await self.extraction_agent.extract_from_page(
+                images[0], retry_context, 1, len(images), []
+            )
+            
+            return result.get('products', [])
+            
+        except Exception as e:
+            logger.warning(f"Erro no retry genérico: {e}")
+            return []
+        
     def _enhance_context_with_layout_and_strategy(
         self, 
         context_info: Dict[str, Any], 
