@@ -16,7 +16,7 @@ from app.extractors.extraction_agent import ExtractionAgent
 from app.extractors.color_mapping_agent import ColorMappingAgent
 from app.extractors.layout_detetion_agent import LayoutDetetionAgent
 from app.extractors.generic_strategy_agent import GenericStrategyAgent
-from app.extractors.validation_agent import ValidationAgent, ValidationResult
+from app.extractors.validators.validation_agent import ValidationAgent, ValidationResult
 
 from app.utils.file_utils import convert_pdf_to_images
 from app.utils.barcode_generator import add_barcodes_to_extraction_result, add_barcodes_to_products
@@ -25,6 +25,14 @@ from app.utils.json_utils import safe_json_dump, fix_nan_in_products, sanitize_f
 from app.utils.supplier_assignment import determine_best_supplier, assign_supplier_to_products
 
 logger = logging.getLogger(__name__)
+
+try:
+    from app.extractors.validators.size_color_validation_agent import SizeColorValidationAgent, SizeColorValidationResult
+    HAS_SIZE_VALIDATION = True
+    logger.info("✅ Sistema de validação de tamanhos carregado")
+except ImportError:
+    HAS_SIZE_VALIDATION = False
+    logger.warning("⚠️ Sistema de validação de tamanhos não disponível")
 
 try:
     from app.utils.json_utils import safe_json_dump, fix_nan_in_products, sanitize_for_json
@@ -44,6 +52,15 @@ class GeminiExtractor(BaseExtractor):
         self.strategy_agent = GenericStrategyAgent()
 
         self.validation_agent = ValidationAgent(api_key)
+        if HAS_SIZE_VALIDATION:
+            try:
+                self.size_validator = SizeColorValidationAgent(api_key)
+                logger.info("✅ Validador de tamanhos e cores inicializado")
+            except Exception as e:
+                logger.warning(f"⚠️ Erro ao inicializar validador de tamanhos: {e}")
+                self.size_validator = None
+            else:
+                self.size_validator = None
 
         self.current_layout_analysis = {}
         self.current_strategy = None
@@ -77,97 +94,76 @@ class GeminiExtractor(BaseExtractor):
         )
         
         return enhanced_context
-    
-    async def extract_with_validation(self, document_path: str, 
-                                    enable_validation: bool = True,
-                                    max_retries: int = 1) -> Dict[str, Any]:    
-         
-        logger.info(f"Iniciando extração com validação para: {document_path}")
-        
-        try:
-            # 1. Extrair normalmente (usando método existente)
-            extraction_result = await self.extract(document_path)
-            products = extraction_result.get('products', [])
-            
-            # Se validação desabilitada, retornar resultado normal
-            if not enable_validation:
-                return extraction_result
-            
-            # 2. Preparar dados para validação
-            images = self._get_document_images(document_path)
-            context = {
-                'document_type': extraction_result.get('document_type', ''),
-                'supplier': extraction_result.get('supplier', ''),
-                'brand': extraction_result.get('brand', ''),
-                'file_name': os.path.basename(document_path)
-            }
-            
-            # 3. Executar validação
-            logger.info("Executando validação da extração...")
-            validation_result = await self.validation_agent.validate_extraction(
-                extracted_products=products,
-                original_context=context,
-                pdf_pages=images,
-                layout_analysis=self.current_layout_analysis
-            )
-            
-            # 4. Verificar se precisa de retry
-            retry_count = 0
-            while (validation_result.confidence_score < 0.6 and 
-                   retry_count < max_retries and 
-                   validation_result.extraction_method != "corrected"):
-                
-                retry_count += 1
-                logger.warning(f"Tentativa {retry_count + 1} devido à baixa confiança "
-                             f"({validation_result.confidence_score:.2f})")
-                
-                # Re-extrair com estratégia diferente se possível
-                products = await self._retry_extraction_with_different_strategy(
-                    document_path, validation_result.recommendations
-                )
-                
-                # Re-validar
-                validation_result = await self.validation_agent.validate_extraction(
-                    extracted_products=products,
-                    original_context=context,
-                    pdf_pages=images,
-                    layout_analysis=self.current_layout_analysis
-                )
-            
-            # 5. Preparar resultado final
-            enhanced_result = extraction_result.copy()
-            enhanced_result.update({
-                'products': validation_result.products,
-                'validation': {
-                    'confidence_score': validation_result.confidence_score,
-                    'completeness_score': validation_result.completeness_score,
-                    'consistency_score': validation_result.consistency_score,
-                    'visual_completeness_score': validation_result.visual_completeness_score,
-                    'density_score': validation_result.density_score,
-                    'extraction_method': validation_result.extraction_method,
-                    'validation_errors': validation_result.validation_errors,
-                    'missing_fields': validation_result.missing_fields,
-                    'recommendations': validation_result.recommendations,
-                    'total_pages_processed': validation_result.total_pages_processed
-                }
-            })
-            
-            logger.info(f"Extração finalizada - Confiança: {validation_result.confidence_score:.2f}, "
-                       f"Produtos: {len(validation_result.products)}")
-            
-            return enhanced_result
-            
-        except Exception as e:
-            logger.exception(f"Erro na extração com validação: {str(e)}")
-            return await self.extract(document_path)
 
-    def _get_document_images(self, document_path: str) -> List[Image.Image]:
+    def _analyze_improvements(self, 
+                        initial_products: List[Dict], 
+                        corrected_products: List[Dict]) -> List[str]:
+        """
+        Analisa e reporta melhorias específicas feitas
+        """
+        improvements = []
+        
+        # Detectar produtos agrupados
+        if len(corrected_products) < len(initial_products):
+            merged_count = len(initial_products) - len(corrected_products)
+            improvements.append(f"Agrupados {merged_count} produtos duplicados por cor")
+        
+        # Detectar correções de tamanhos
+        initial_sizes = set()
+        corrected_sizes = set()
+        
+        for product in initial_products:
+            for color in product.get('colors', []):
+                for size in color.get('sizes', []):
+                    initial_sizes.add(size.get('size', ''))
+        
+        for product in corrected_products:
+            for color in product.get('colors', []):
+                for size in color.get('sizes', []):
+                    corrected_sizes.add(size.get('size', ''))
+        
+        # Verificar se houve mudanças significativas nos tamanhos
+        size_changes = corrected_sizes - initial_sizes
+        if size_changes:
+            improvements.append(f"Corrigidos tamanhos incorretos: {', '.join(list(size_changes)[:3])}")
+        
+        # Detectar melhorias na completude
+        initial_complete = sum(1 for p in initial_products if self._is_product_complete(p))
+        corrected_complete = sum(1 for p in corrected_products if self._is_product_complete(p))
+        
+        if corrected_complete > initial_complete:
+            improvement = corrected_complete - initial_complete
+            improvements.append(f"Recuperados dados completos para {improvement} produtos")
+        
+        return improvements
+
+    def _is_product_complete(self, product: Dict) -> bool:
+        """Verifica se produto tem dados completos"""
+        if not product.get('material_code') or not product.get('product_name'):
+            return False
+        
+        colors = product.get('colors', [])
+        if not colors:
+            return False
+        
+        for color in colors:
+            sizes = color.get('sizes', [])
+            if sizes and any(s.get('quantity', 0) > 0 for s in sizes):
+                return True
+        
+        return False
+
+    def _get_document_images_safe(self, document_path: str) -> List[Image.Image]:
+        """Obter imagens do documento de forma segura"""
         try:
-            from app.utils.file_utils import convert_pdf_to_images
-            from PIL import Image
+            if not document_path.lower().endswith('.pdf'):
+                return []
             
-            # Converter PDF para imagens
+            # Usar método existente
             image_paths = convert_pdf_to_images(document_path, CONVERTED_DIR)
+            
+            if not image_paths:
+                return []
             
             images = []
             for img_path in image_paths:
@@ -175,58 +171,121 @@ class GeminiExtractor(BaseExtractor):
                     img = Image.open(img_path)
                     images.append(img)
                 except Exception as e:
-                    logger.warning(f"Erro ao carregar imagem {img_path}: {e}")
+                    logger.warning(f"⚠️ Erro ao carregar {img_path}: {e}")
             
+            logger.info(f"🖼️ Carregadas {len(images)} imagens")
             return images
             
         except Exception as e:
-            logger.warning(f"Erro ao converter PDF para imagens: {e}")
+            logger.warning(f"⚠️ Erro ao obter imagens: {e}")
             return []
-    
-    async def _retry_extraction_with_different_strategy(self, 
-                                                       document_path: str,
-                                                       recommendations: List[str]) -> List[Dict]:
-        """
-        Tenta re-extração com estratégia alternativa baseada nas recomendações
-        """
+        
+    async def extract_with_size_validation(self, document_path: str, confidence_threshold: float = 0.7) -> Dict[str, Any]:
+     
+        logger.info(f"📏 Iniciando extração com validação de tamanhos para: {os.path.basename(document_path)}")
+        
         try:
-            logger.info("Tentando estratégia alternativa de extração...")
+            # 1. Executar extração normal primeiro
+            logger.info("🚀 Executando extração inicial...")
+            extraction_result = await self.extract(document_path)
+            initial_products = extraction_result.get('products', [])
             
-            # Analisar recomendações para escolher estratégia
-            if any("visual" in rec.lower() for rec in recommendations):
-                # Se problema é visual, tentar extração mais conservadora
-                return await self._conservative_extraction(document_path)
-            elif any("estrutura" in rec.lower() for rec in recommendations):
-                # Se problema é estrutural, tentar abordagem diferente
-                return await self._alternative_structure_extraction(document_path)
-            else:
-                # Estratégia genérica de retry
-                return await self._generic_retry_extraction(document_path)
-                
-        except Exception as e:
-            logger.warning(f"Erro na re-extração: {e}")
-            return []
-    
-    async def _conservative_extraction(self, document_path: str) -> List[Dict]:
-        """Extração conservadora focada em dados de alta confiança"""
-        try:
-            # Usar apenas primeira página com análise detalhada
-            images = self._get_document_images(document_path)
+            logger.info(f"📊 Extração inicial: {len(initial_products)} produtos")
+            
+            # 2. Se não há validação disponível, retornar resultado normal
+            if not HAS_SIZE_VALIDATION or not self.size_validator:
+                logger.info("📄 Validação de tamanhos não disponível")
+                extraction_result['size_validation'] = {
+                    'enabled': False,
+                    'message': 'Sistema não disponível'
+                }
+                return extraction_result
+            
+            # 3. Obter imagens para análise visual
+            images = self._get_document_images_safe(document_path)
             if not images:
-                return []
+                logger.warning("⚠️ Sem imagens para validação visual de tamanhos")
+                extraction_result['size_validation'] = {
+                    'enabled': False,
+                    'message': 'Sem imagens para análise'
+                }
+                return extraction_result
             
-            context = self.current_context_info or {}
+            logger.info(f"🖼️ Carregadas {len(images)} imagens para validação")
             
-            # Estratégia conservadora - extrair apenas dados claramente visíveis
-            conservative_result = await self.extraction_agent.extract_from_page(
-                images[0], context, 1, 1, []
+            # 4. Executar validação de tamanhos e cores
+            logger.info("🔍 Executando validação de tamanhos e cores...")
+            
+            validation_result = await self.size_validator.validate_and_correct(
+                products=initial_products,
+                page_images=images,
+                confidence_threshold=confidence_threshold
             )
             
-            return conservative_result.get('products', [])
+            # 5. Analisar resultados da validação
+            corrected_products = validation_result.corrected_products
+            corrections_made = validation_result.corrections_made
+            
+            logger.info(f"📈 Validação de tamanhos concluída:")
+            logger.info(f"   - Produtos iniciais: {len(initial_products)}")
+            logger.info(f"   - Produtos finais: {len(corrected_products)}")
+            logger.info(f"   - Correções aplicadas: {len(corrections_made)}")
+            logger.info(f"   - Confiança: {validation_result.confidence_score:.2f}")
+            
+            # 6. Log das correções aplicadas
+            if corrections_made:
+                logger.info("🔧 Correções aplicadas:")
+                for correction in corrections_made[:5]:  # Primeiras 5
+                    logger.info(f"   - {correction}")
+                if len(corrections_made) > 5:
+                    logger.info(f"   - ... e mais {len(corrections_made) - 5} correções")
+            
+            # 7. Detectar melhorias específicas
+            improvements = self._analyze_improvements(initial_products, corrected_products)
+            if improvements:
+                logger.info("✨ Melhorias detectadas:")
+                for improvement in improvements:
+                    logger.info(f"   - {improvement}")
+            
+            # 8. Preparar resultado final
+            enhanced_result = extraction_result.copy()
+            enhanced_result.update({
+                'products': corrected_products,
+                'size_validation': {
+                    'enabled': True,
+                    'confidence_score': validation_result.confidence_score,
+                    'corrections_made': corrections_made,
+                    'validation_errors': validation_result.validation_errors,
+                    'size_alignment_issues': validation_result.size_alignment_issues,
+                    'color_grouping_issues': validation_result.color_grouping_issues,
+                    'products_initial': len(initial_products),
+                    'products_final': len(corrected_products),
+                    'products_merged': len(initial_products) - len(corrected_products),
+                    'improvements_detected': improvements,
+                    'confidence_threshold_used': confidence_threshold
+                }
+            })
+            
+            # 9. Status final
+            if validation_result.confidence_score >= 0.8:
+                logger.info(f"✅ Alta confiança nas correções ({validation_result.confidence_score:.2f})")
+            elif validation_result.confidence_score >= 0.6:
+                logger.info(f"⚠️ Confiança média ({validation_result.confidence_score:.2f}) - verificar resultados")
+            else:
+                logger.warning(f"❌ Baixa confiança ({validation_result.confidence_score:.2f}) - possíveis problemas")
+            
+            return enhanced_result
             
         except Exception as e:
-            logger.warning(f"Erro na extração conservadora: {e}")
-            return []
+            logger.exception(f"❌ Erro na validação de tamanhos: {str(e)}")
+            
+            # Fallback para resultado original
+            extraction_result['size_validation'] = {
+                'enabled': False,
+                'error': str(e),
+                'message': 'Validação falhou - resultado da extração normal'
+            }
+            return extraction_result
 
     async def _alternative_structure_extraction(self, document_path: str) -> List[Dict]:
         """Extração com abordagem estrutural alternativa"""
