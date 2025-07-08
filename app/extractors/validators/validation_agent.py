@@ -521,3 +521,349 @@ class ValidationAgent:
         except Exception as e:
             logger.warning(f"Erro ao extrair JSON: {e}")
             return None
+    
+    async def _validate_single_product_non_destructive(self, product: Dict, images: List, material_code: str) -> List[str]:
+
+        corrections = []
+        
+        try:
+            validation_prompt = f"""
+            # VALIDAÇÃO NÃO-DESTRUTIVA DO PRODUTO: {material_code}
+            
+            Você vai validar apenas TAMANHOS, QUANTIDADES e CÓDIGOS DE CORES.
+            NÃO ALTERE nem comente sobre preços, fornecedores, ou outros campos.
+            
+            ## PRODUTO EXTRAÍDO:
+            - Código: {product.get('material_code', '')}
+            - Nome: {product.get('name', '')}
+            - Cores encontradas: {len(product.get('colors', []))}
+            
+            ## CORES E TAMANHOS EXTRAÍDOS:
+            """
+            
+            for i, color in enumerate(product.get('colors', [])):
+                validation_prompt += f"""
+            Cor {i+1}:
+            - Código: {color.get('color_code', '')}
+            - Nome: {color.get('color_name', '')}
+            - Tamanhos: {[s.get('size') for s in color.get('sizes', [])]}
+            - Quantidades: {[s.get('quantity') for s in color.get('sizes', [])]}
+            """
+            
+            validation_prompt += f"""
+            
+            ## SUA TAREFA LIMITADA:
+            
+            1. **VERIFICAR SE OS TAMANHOS ESTÃO CORRETOS** (comparar com tabela)
+            2. **VERIFICAR SE AS QUANTIDADES ESTÃO CORRETAS** (mapear posicionalmente)
+            3. **VERIFICAR SE OS CÓDIGOS DE CORES ESTÃO CORRETOS**
+            
+            ## FORMATO DE RESPOSTA SIMPLES:
+            
+            ```json
+            {{
+            "status": "OK" ou "CORRIGIR_TAMANHOS" ou "CORRIGIR_CORES",
+            "corrections_needed": [
+                "Tamanho XL incluído mas sem quantidade na tabela",
+                "Falta tamanho S com quantidade 2",
+                "Código da cor 1 deveria ser 018 em vez de 011"
+            ]
+            }}
+            ```
+            
+            IMPORTANTE: NÃO retorne produto corrigido, apenas liste as correções necessárias.
+            """
+            
+            # Enviar para IA para validação
+            response = await self._send_validation_request(validation_prompt, images[0])
+            
+            # Processar resposta
+            validation_result = self._parse_validation_response(response)
+            
+            if validation_result.get("status") in ["CORRIGIR_TAMANHOS", "CORRIGIR_CORES"]:
+                corrections = validation_result.get("corrections_needed", [])
+                
+                await self._apply_specific_corrections(product, corrections, images[0])
+                
+                logger.info(f"Produto {material_code} corrigido pontualmente")
+            
+            return corrections
+            
+        except Exception as e:
+            logger.error(f"Erro na validação do produto {material_code}: {e}")
+            return []
+    
+    async def _apply_specific_corrections(self, product: Dict, corrections: List[str], image) -> None:
+        try:
+            for correction in corrections:
+                correction_lower = correction.lower()
+                
+                # Correções de tamanhos
+                if "falta tamanho" in correction_lower:
+                    # Extrair tamanho e quantidade da correção
+                    size_match = re.search(r'tamanho (\w+)', correction)
+                    qty_match = re.search(r'quantidade (\d+)', correction)
+                    
+                    if size_match:
+                        size_to_add = size_match.group(1)
+                        quantity_to_add = int(qty_match.group(1)) if qty_match else 1
+                        
+                        # Adicionar tamanho à primeira cor (assumindo que é a correção mais comum)
+                        if product.get('colors') and len(product['colors']) > 0:
+                            sizes_list = product['colors'][0].get('sizes', [])
+                            
+                            # Verificar se o tamanho já existe
+                            size_exists = any(s.get('size') == size_to_add for s in sizes_list)
+                            
+                            if not size_exists:
+                                sizes_list.append({
+                                    "size": size_to_add,
+                                    "quantity": quantity_to_add
+                                })
+                                logger.info(f"✅ Adicionado tamanho {size_to_add} com quantidade {quantity_to_add}")
+                
+                elif "tamanho" in correction_lower and "incluído mas sem quantidade" in correction_lower:
+                    # Remover tamanho que não deveria estar lá
+                    size_match = re.search(r'tamanho (\w+)', correction)
+                    
+                    if size_match:
+                        size_to_remove = size_match.group(1)
+                        
+                        for color in product.get('colors', []):
+                            sizes_list = color.get('sizes', [])
+                            # Filtrar tamanhos, removendo o problemático
+                            color['sizes'] = [s for s in sizes_list if s.get('size') != size_to_remove]
+                            logger.info(f"✅ Removido tamanho {size_to_remove} sem quantidade")
+                
+                # Correções de códigos de cores
+                elif "código da cor" in correction_lower and "deveria ser" in correction_lower:
+                    # Extrair códigos da correção
+                    code_match = re.search(r'deveria ser (\w+) em vez de (\w+)', correction)
+                    
+                    if code_match:
+                        correct_code = code_match.group(1)
+                        wrong_code = code_match.group(2)
+                        
+                        for color in product.get('colors', []):
+                            if color.get('color_code') == wrong_code:
+                                color['color_code'] = correct_code
+                                logger.info(f"✅ Corrigido código de cor de {wrong_code} para {correct_code}")
+                
+                # Correções de quantidades
+                elif "quantidade" in correction_lower and "incorreta" in correction_lower:
+                    # Para correções mais complexas de quantidades, pode implementar lógica adicional
+                    logger.info(f"⚠️ Correção de quantidade detectada mas não implementada: {correction}")
+                    
+        except Exception as e:
+            logger.warning(f"Erro ao aplicar correção '{correction}': {e}")
+
+    async def validate_products_individually(self, extraction_result: Dict[str, Any], document_path: str) -> Dict[str, Any]:
+            logger.info("🔍 Iniciando validação produto por produto...")
+            
+            products = extraction_result.get("products", [])
+            if not products:
+                logger.warning("Nenhum produto para validar")
+                return extraction_result
+            
+            # Obter imagens do documento
+            images = self._get_document_images_safe(document_path)
+            if not images:
+                logger.warning("Sem imagens para validação visual")
+                return extraction_result
+            
+            validated_products = []
+            validation_stats = {
+                "total_products": len(products),
+                "products_corrected": 0,
+                "sizes_corrected": 0,
+                "colors_corrected": 0,
+                "corrections_made": []
+            }
+            
+            # Validar cada produto individualmente
+            for i, product in enumerate(products):
+                material_code = product.get("material_code", "")
+                product_name = product.get("name", "")
+                
+                logger.info(f"🔍 Validando produto {i+1}/{len(products)}: {material_code} - {product_name}")
+                
+                # MUDANÇA: Criar cópia completa do produto original
+                validated_product = product.copy()
+                
+                # Validação específica para este produto
+                corrections = await self._validate_single_product_non_destructive(
+                    validated_product, images, material_code
+                )
+                
+                validated_products.append(validated_product)
+                
+                # Registrar correções
+                if corrections:
+                    validation_stats["products_corrected"] += 1
+                    validation_stats["corrections_made"].extend(corrections)
+                    
+                    # Contar tipos de correções
+                    for correction in corrections:
+                        if "tamanho" in correction.lower():
+                            validation_stats["sizes_corrected"] += 1
+                        if "cor" in correction.lower():
+                            validation_stats["colors_corrected"] += 1
+                    
+                    logger.info(f"✅ Produto {material_code}: {len(corrections)} correções aplicadas")
+                else:
+                    logger.info(f"✅ Produto {material_code}: OK, nenhuma correção necessária")
+            
+            # MUDANÇA: Preservar toda a estrutura original
+            validated_result = extraction_result.copy()
+            validated_result["products"] = validated_products
+            validated_result["individual_validation"] = validation_stats
+            
+            # Log final
+            logger.info(f"🎉 Validação individual concluída:")
+            logger.info(f"   - Produtos validados: {validation_stats['total_products']}")
+            logger.info(f"   - Produtos corrigidos: {validation_stats['products_corrected']}")
+            logger.info(f"   - Tamanhos corrigidos: {validation_stats['sizes_corrected']}")
+            logger.info(f"   - Cores corrigidas: {validation_stats['colors_corrected']}")
+            
+            return validated_result
+
+    async def _validate_single_product(self, product: Dict, images: List, material_code: str) -> Tuple[Dict, List[str]]:
+        """
+        Valida um único produto contra as imagens
+        """
+        corrections = []
+        validated_product = product.copy()
+        
+        try:
+            # Prompt específico para validar este produto
+            validation_prompt = f"""
+            # VALIDAÇÃO ESPECÍFICA DO PRODUTO: {material_code}
+            
+            Você vai validar se este produto foi extraído corretamente das imagens.
+            
+            ## PRODUTO EXTRAÍDO:
+            - Código: {product.get('material_code', '')}
+            - Nome: {product.get('name', '')}
+            - Categoria: {product.get('category', '')}
+            - Cores encontradas: {len(product.get('colors', []))}
+            
+            ## CORES E TAMANHOS EXTRAÍDOS:
+            """
+            
+            for i, color in enumerate(product.get('colors', [])):
+                validation_prompt += f"""
+            Cor {i+1}:
+            - Código: {color.get('color_code', '')}
+            - Nome: {color.get('color_name', '')}
+            - Tamanhos: {[s.get('size') for s in color.get('sizes', [])]}
+            - Quantidades: {[s.get('quantity') for s in color.get('sizes', [])]}
+            """
+            
+            validation_prompt += f"""
+            
+            ## SUA TAREFA:
+            
+            1. **VERIFICAR SE O PRODUTO {material_code} ESTÁ VISÍVEL** nas imagens
+            2. **CONFERIR SE OS TAMANHOS ESTÃO CORRETOS** (comparar com tabela)
+            3. **CONFERIR SE AS QUANTIDADES ESTÃO CORRETAS** (mapear posicionalmente)
+            4. **CONFERIR SE AS CORES ESTÃO CORRETAS** (códigos e nomes)
+            
+            ## REGRAS DE VALIDAÇÃO:
+            
+            **Para TAMANHOS:**
+            - Verificar se todos os tamanhos com quantidade > 0 estão incluídos
+            - Verificar se não há tamanhos sem quantidade que foram incluídos
+            - Mapear posicionalmente: tamanho = posição da quantidade
+            
+            **Para CORES:**
+            - Verificar se o código da cor corresponde ao nome
+            - Verificar se há cores em falta
+            
+            ## FORMATO DE RESPOSTA:
+            
+            ```json
+            {{
+            "status": "OK" ou "CORRIGIR",
+            "corrections_needed": [
+                "Tamanho XL incluído mas sem quantidade na tabela",
+                "Falta tamanho S com quantidade 2",
+                "Cor azul tem código errado"
+            ],
+            "corrected_product": {{
+                // Produto corrigido (só se status = "CORRIGIR")
+                "name": "...",
+                "material_code": "{material_code}",
+                "colors": [
+                {{
+                    "color_code": "...",
+                    "color_name": "...", 
+                    "sizes": [
+                    {{"size": "S", "quantity": 2}},
+                    {{"size": "M", "quantity": 1}}
+                    ]
+                }}
+                ]
+            }}
+            }}
+            ```
+            
+            IMPORTANTE: Se status = "OK", não inclua "corrected_product"
+            """
+            
+            # Enviar para IA para validação
+            response = await self._send_validation_request(validation_prompt, images[0])
+            
+            # Processar resposta
+            validation_result = self._parse_validation_response(response)
+            
+            if validation_result.get("status") == "CORRIGIR":
+                corrections = validation_result.get("corrections_needed", [])
+                corrected_product = validation_result.get("corrected_product")
+                
+                if corrected_product:
+                    # Manter campos originais e atualizar apenas os corrigidos
+                    validated_product.update(corrected_product)
+                    logger.info(f"Produto {material_code} corrigido com base na validação visual")
+            
+            return validated_product, corrections
+            
+        except Exception as e:
+            logger.error(f"Erro na validação do produto {material_code}: {e}")
+            return validated_product, []
+    
+    def _get_document_images_safe(self, document_path: str) -> List[Image.Image]:
+        """Obter imagens do documento para validação"""
+        try:
+            if not document_path.lower().endswith('.pdf'):
+                return []
+            
+            from app.utils.file_utils import convert_pdf_to_images
+            from app.config import CONVERTED_DIR
+            
+            image_paths = convert_pdf_to_images(document_path, CONVERTED_DIR)
+            images = []
+            
+            for img_path in image_paths:
+                try:
+                    img = Image.open(img_path)
+                    images.append(img)
+                except Exception as e:
+                    logger.warning(f"Erro ao carregar imagem {img_path}: {e}")
+            
+            return images
+        except Exception as e:
+            logger.warning(f"Erro ao obter imagens: {e}")
+            return []
+
+    async def _send_validation_request(self, prompt: str, image) -> str:
+        """Enviar request de validação para a IA"""
+        try:
+            response = self.model.generate_content([prompt, image])
+            return response.text
+        except Exception as e:
+            logger.error(f"Erro na requisição de validação: {e}")
+            return ""
+
+    def _parse_validation_response(self, response_text: str) -> Dict:
+        """Processar resposta da validação"""
+        return self._extract_json_safely(response_text)

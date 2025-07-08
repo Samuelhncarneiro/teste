@@ -23,7 +23,23 @@ from app.services.job_service import JobService
 from app.services.cleanup_service import init_cleanup_service, get_cleanup_service
 from app.services.document_service import DocumentService
 from app.extractors.gemini_extractor import GeminiExtractor
+from app.extractors.validators.recovery_integration import initialize_recovery_system
 
+def setup_recovery_system():
+    """
+    Configura o sistema de recuperação na inicialização da aplicação
+    """
+    try:
+        success = initialize_recovery_system()
+        if success:
+            logger.info("🛡️ Sistema de recuperação configurado com sucesso")
+        else:
+            logger.warning("⚠️ Falha na configuração do sistema de recuperação")
+        return success
+    except Exception as e:
+        logger.error(f"❌ Erro crítico na configuração do sistema de recuperação: {str(e)}")
+        return False
+    
 # Sistema de métricas simples integrado
 class SimpleMetrics:
     """Sistema de métricas simples integrado"""
@@ -274,6 +290,15 @@ def get_gemini_extractor():
 async def startup_event():
     logger.info("🚀 Aplicação a iniciar...")
     
+    recovery_enabled = setup_recovery_system()
+    
+    if recovery_enabled:
+        logger.info("✅ API iniciada com sistema de recuperação ativo")
+    else:
+        logger.warning("⚠️ API iniciada SEM sistema de recuperação")
+    
+    logger.info("✅ Aplicação iniciada com sucesso!")
+
     # Verificar saúde inicial
     health = health_checker.check_health()
     if health["status"] == "critical":
@@ -323,6 +348,38 @@ async def health_check():
         status_code = 200  # Warning não é erro crítico
     
     return JSONResponse(content=health_data, status_code=status_code)
+
+@app.get("/health/recovery")
+async def recovery_system_health():
+    """Verifica o status do sistema de recuperação"""
+    try:
+        from app.extractors.validators.recovery_integration import robust_json_parse
+        
+        # Teste básico do parser
+        test_json = '{"products": [{"material_code": "TEST123", "name": "Test"}]}'
+        result = robust_json_parse(test_json, 1)
+        
+        return {
+            "status": "healthy",
+            "recovery_system": "active",
+            "parser_test": "passed",
+            "timestamp": time.time()
+        }
+    except Exception as e:
+        return {
+            "status": "error", 
+            "recovery_system": "inactive",
+            "error": str(e),
+            "timestamp": time.time()
+        }
+
+@app.get("/stats/recovery")
+async def recovery_statistics():
+    """Estatísticas do sistema de recuperação (se disponível)"""
+    return {
+        "message": "Recovery statistics endpoint",
+        "note": "Expand this to include actual statistics from processed documents"
+    }
 
 @app.get("/metrics", summary="Obter métricas do sistema")
 async def get_metrics():

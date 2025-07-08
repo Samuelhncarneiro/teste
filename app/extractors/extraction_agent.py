@@ -114,7 +114,92 @@ class ExtractionAgent:
             return """- Código do material: IDENTIFICAR por padrões alfanuméricos únicos no texto
             - Procurar por códigos como: CF5015E0624, AB123456, 50469055, T3216
             - Geralmente próximo ao nome do produto ou no início da linha"""
-            
+
+    def _create_individual_size_prompt(self, context: str, page_number: int, total_pages: int) -> str:
+
+        headers_detected = self._extract_headers_from_context(context)
+        material_code_instructions = self._get_material_code_instructions(headers_detected)
+        
+        return f"""
+        # INSTRUÇÕES PARA EXTRAÇÃO GRANULAR POR TAMANHO
+        
+        Você é um especialista em extrair dados de produtos de documentos comerciais.
+        Esta é a página {page_number} de {total_pages}.
+        
+        {context}
+        
+        ## REGRA FUNDAMENTAL: GRANULARIDADE MÁXIMA
+        
+        **CADA COMBINAÇÃO CÓDIGO+COR+TAMANHO = UM PRODUTO SEPARADO**
+        
+        **EXEMPLO DO QUE QUERO:**
+        Se vir na tabela:
+        ```
+        CF5271MA96E  Preto(M9799)   S  M  L  →  1  1  1
+        CF5271MA96E  Bege(M9990)   XS  S  M  →  1  1  1
+        ```
+        
+        **DEVE EXTRAIR 6 PRODUTOS SEPARADOS:**
+        ```json
+        [
+        {{"name": "Malha Fechada M/L", "material_code": "CF5271MA96E", "color_code": "010", "color_name": "Preto", "size": "S", "quantity": 1}},
+        {{"name": "Malha Fechada M/L", "material_code": "CF5271MA96E", "color_code": "010", "color_name": "Preto", "size": "M", "quantity": 1}},
+        {{"name": "Malha Fechada M/L", "material_code": "CF5271MA96E", "color_code": "010", "color_name": "Preto", "size": "L", "quantity": 1}},
+        {{"name": "Malha Fechada M/L", "material_code": "CF5271MA96E", "color_code": "012", "color_name": "Bege", "size": "XS", "quantity": 1}},
+        {{"name": "Malha Fechada M/L", "material_code": "CF5271MA96E", "color_code": "012", "color_name": "Bege", "size": "S", "quantity": 1}},
+        {{"name": "Malha Fechada M/L", "material_code": "CF5271MA96E", "color_code": "012", "color_name": "Bege", "size": "M", "quantity": 1}}
+        ]
+        ```
+        
+        ## ALGORITMO DE EXTRAÇÃO:
+        
+        1. **Identificar produto base** (código + nome)
+        2. **Para cada cor desse produto:**
+        3. **Para cada tamanho com quantidade > 0:**
+            4. **Criar produto individual separado**
+        
+        ## REGRAS CRÍTICAS:
+        
+        - **NUNCA** agrupar tamanhos no mesmo produto
+        - **NUNCA** agrupar cores no mesmo produto  
+        - **SEMPRE** criar produto separado para cada combinação única
+        - **SÓ** incluir tamanhos que têm quantidade explícita > 0
+        - **USAR** mapeamento posicional rigoroso (tamanho = posição da quantidade)
+        
+        {material_code_instructions}
+        
+        ## FORMATO DE RESPOSTA OBRIGATÓRIO:
+        
+        ```json
+        {{
+        "products": [
+            {{
+            "name": "Nome do produto",
+            "material_code": "Código do material",
+            "category": "Categoria em português - usar: {CATEGORIES}",
+            "model": "Modelo/descrição",
+            "composition": null,
+            "color_code": "Código da cor",
+            "color_name": "Nome da cor",
+            "size": "Tamanho específico",
+            "quantity": 1,
+            "unit_price": 0.0,
+            "sales_price": 0.0
+            }}
+        ]
+        }}
+        ```
+        
+        ## VERIFICAÇÕES OBRIGATÓRIAS:
+        
+        ✅ Cada objeto no array "products" tem APENAS 1 tamanho
+        ✅ Cada objeto no array "products" tem APENAS 1 cor
+        ✅ Tamanhos sem quantidade NÃO são incluídos
+        ✅ Mapeamento posicional correto entre tamanho e quantidade
+        
+        EXTRAIA AGORA seguindo RIGOROSAMENTE estas regras.
+        """
+        
     def _create_first_page_prompt(
         self, context: str, page_number: int, total_pages: int, json_template: str
     ) -> str:
@@ -392,7 +477,6 @@ class ExtractionAgent:
                                     except (ValueError, TypeError):
                                         continue
                             
-                            # NOVO: Usar o detector para normalizar
                             clean_sizes = self.size_detector.normalize_size_extraction(
                                 preliminary_sizes, 
                                 product.get("category", "")

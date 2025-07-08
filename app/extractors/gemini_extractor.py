@@ -1022,7 +1022,18 @@ class GeminiExtractor(BaseExtractor):
             rocessing_time = time.time() - start_time
             logger.info(f"⏱️ Tempo total de processamento: {processing_time:.2f}s")  
             logger.info(f"📊 Taxa de produtos por segundo: {total_products/processing_time:.2f}")
-
+            
+            if self.validation_agent:
+                logger.info("🔍 Iniciando validação individual de produtos...")
+                jobs_store[job_id]["model_results"]["gemini"]["progress"] = 95.0
+                
+                validated_result = await self.validation_agent.validate_products_individually(
+                    combined_result, 
+                    document_path
+                )
+                
+                combined_result = validated_result
+                
             return combined_result
                 
         except Exception as e:
