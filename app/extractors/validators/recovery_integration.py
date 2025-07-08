@@ -85,7 +85,10 @@ def robust_json_parse(response_text: str, page_number: int) -> Dict[str, Any]:
                 "colors": [{
                     "color_code": "001",
                     "color_name": "Padrão", 
-                    "sizes": [{"size": "UN", "quantity": 1}]
+                    "sizes": [{"size": "UN", "quantity": 1}],
+                "unit_price": 000.00,
+                "sales_price": 000.00,
+                "subtotal": 000.00
                 }]
             })
         
