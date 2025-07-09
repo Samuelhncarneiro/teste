@@ -23,6 +23,7 @@ from app.services.job_service import JobService
 from app.services.cleanup_service import init_cleanup_service, get_cleanup_service
 from app.services.document_service import DocumentService
 from app.extractors.gemini_extractor import GeminiExtractor
+from app.extractors.validators.recovery_integration import initialize_recovery_system
 
 # Sistema de métricas simples integrado
 class SimpleMetrics:
@@ -252,6 +253,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.on_event("startup")
+async def startup_event():
+    """Inicialização da aplicação"""
+    logger.info("🚀 Aplicação a iniciar...")
+    
+    # Ativar sistema de recuperação
+    if initialize_recovery_system():
+        logger.info("✅ Sistema de recuperação ativado")
+    else:
+        logger.warning("⚠️ Sistema de recuperação não pôde ser ativado")
+    
+    logger.info("✅ Aplicação iniciada com sucesso!")
+    
 # Middleware para métricas
 @app.middleware("http")
 async def metrics_middleware(request, call_next):

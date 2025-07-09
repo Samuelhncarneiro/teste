@@ -1023,16 +1023,24 @@ class GeminiExtractor(BaseExtractor):
             logger.info(f"⏱️ Tempo total de processamento: {processing_time:.2f}s")  
             logger.info(f"📊 Taxa de produtos por segundo: {total_products/processing_time:.2f}")
             
-            if self.validation_agent:
-                logger.info("🔍 Iniciando validação individual de produtos...")
-                jobs_store[job_id]["model_results"]["gemini"]["progress"] = 95.0
+            needs_validation = False
+            for product in combined_result.get("products", []):
+                for color in product.get("colors", []):
+                    color_code = color.get("color_code", "")
+                    # Se tem código original (22222, X0707, etc.), precisa validação
+                    if color_code and len(color_code) > 3:
+                        needs_validation = True
+                        break
+
+            if needs_validation:
+                logger.info("⚠️ Executando validação...")
+                validation_agent = ValidationAgent()
+                validated_result = validation_agent.validate_extraction_result(combined_result)
+                if validated_result:
+                    combined_result = validated_result
+            else:
+                logger.info("✅ Color mapping preservado - pulando validação")
                 
-                validated_result = await self.validation_agent.validate_products_individually(
-                    combined_result, 
-                    document_path
-                )
-                
-                combined_result = validated_result
                 
             return combined_result
                 
