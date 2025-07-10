@@ -110,69 +110,96 @@ def safe_json_dump(obj: Any, file_path: str, **kwargs) -> bool:
             return False
 
 def fix_nan_in_products(products: List[Dict[str, Any]], markup: float = 2.73) -> List[Dict[str, Any]]:
-    """
-    Corrige valores NaN em produtos, recalculando preços quando necessário
-    """
+
+    if not products:
+        logger.warning("fix_nan_in_products recebeu lista vazia")
+        return []
+    
+    logger.debug(f"fix_nan_in_products: processando {len(products)} produtos")
     fixed_products = []
     
-    for product in products:
+    for idx, product in enumerate(products):
         if not isinstance(product, dict):
+            logger.warning(f"Produto {idx} não é dict: {type(product)}")
             continue
         
-        if "colors" in product and isinstance(product["colors"], list):
+        # Criar cópia do produto para não modificar o original
+        fixed_product = product.copy()
+        
+        # Processar cores se existirem
+        if "colors" in fixed_product and isinstance(fixed_product["colors"], list):
             fixed_colors = []
             
-            for color in product["colors"]:
-                if "unit_price" not in color or color["unit_price"] is None or (
-                    isinstance(color["unit_price"], float) and math.isnan(color["unit_price"])
-                ):
-                    color["unit_price"] = 0.0
+            for color_idx, color in enumerate(fixed_product["colors"]):
+                if not isinstance(color, dict):
+                    logger.warning(f"Cor {color_idx} do produto {idx} não é dict")
+                    continue
                 
-                if "sales_price" not in color or color["sales_price"] is None or (
-                    isinstance(color["sales_price"], float) and math.isnan(color["sales_price"])
-                ):
-                    color["sales_price"] = round(color["unit_price"] * markup, 2)
+                # Criar cópia da cor
+                fixed_color = color.copy()
                 
-                if "subtotal" not in color or color["subtotal"] is None or (
-                    isinstance(color["subtotal"], float) and math.isnan(color["subtotal"])
+                # Corrigir unit_price
+                if "unit_price" not in fixed_color or fixed_color["unit_price"] is None or (
+                    isinstance(fixed_color["unit_price"], float) and math.isnan(fixed_color["unit_price"])
                 ):
-                    total_quantity = sum(
-                        size.get("quantity", 0) 
-                        for size in color.get("sizes", []) 
-                        if size.get("quantity") is not None
-                    )
-                    color["subtotal"] = round(color["unit_price"] * total_quantity, 2)
+                    fixed_color["unit_price"] = 0.0
                 
-                if "sizes" in color and isinstance(color["sizes"], list):
+                # Corrigir sales_price
+                if "sales_price" not in fixed_color or fixed_color["sales_price"] is None or (
+                    isinstance(fixed_color["sales_price"], float) and math.isnan(fixed_color["sales_price"])
+                ):
+                    fixed_color["sales_price"] = round(fixed_color["unit_price"] * markup, 2)
+                
+                # Corrigir subtotal
+                if "subtotal" not in fixed_color or fixed_color["subtotal"] is None or (
+                    isinstance(fixed_color["subtotal"], float) and math.isnan(fixed_color["subtotal"])
+                ):
+                    # Calcular subtotal baseado nas quantidades
+                    total_quantity = 0
+                    if "sizes" in fixed_color and isinstance(fixed_color["sizes"], list):
+                        for size in fixed_color["sizes"]:
+                            if isinstance(size, dict) and "quantity" in size:
+                                qty = size.get("quantity", 0)
+                                if qty and not (isinstance(qty, float) and math.isnan(qty)):
+                                    total_quantity += qty
+                    
+                    fixed_color["subtotal"] = round(fixed_color["unit_price"] * total_quantity, 2)
+                
+                # Processar tamanhos
+                if "sizes" in fixed_color and isinstance(fixed_color["sizes"], list):
                     fixed_sizes = []
-                    
-                    for size in color["sizes"]:
-                        if "quantity" not in size or size["quantity"] is None or (
-                            isinstance(size["quantity"], float) and math.isnan(size["quantity"])
-                        ):
-                            size["quantity"] = 0
-                        
-                        if size.get("quantity", 0) > 0:
-                            fixed_sizes.append(size)
-                    
-                    color["sizes"] = fixed_sizes
+                    for size in fixed_color["sizes"]:
+                        if isinstance(size, dict):
+                            fixed_size = size.copy()
+                            # Garantir que quantity não é NaN
+                            if "quantity" in fixed_size:
+                                qty = fixed_size["quantity"]
+                                if qty is None or (isinstance(qty, float) and math.isnan(qty)):
+                                    fixed_size["quantity"] = 0
+                            fixed_sizes.append(fixed_size)
+                    fixed_color["sizes"] = fixed_sizes
                 
-                if color.get("sizes", []):
-                    fixed_colors.append(color)
+                fixed_colors.append(fixed_color)
             
-            product["colors"] = fixed_colors
+            fixed_product["colors"] = fixed_colors
         
-        if "total_price" not in product or product["total_price"] is None or (
-            isinstance(product["total_price"], float) and math.isnan(product["total_price"])
+        # Corrigir total_price do produto
+        if "total_price" not in fixed_product or fixed_product["total_price"] is None or (
+            isinstance(fixed_product["total_price"], float) and math.isnan(fixed_product["total_price"])
         ):
-            subtotals = [
-                color.get("subtotal", 0) 
-                for color in product.get("colors", []) 
-                if color.get("subtotal") is not None
-            ]
-            product["total_price"] = sum(subtotals)
+            # Calcular total baseado nos subtotais das cores
+            total = 0.0
+            if "colors" in fixed_product:
+                for color in fixed_product["colors"]:
+                    if isinstance(color, dict) and "subtotal" in color:
+                        subtotal = color["subtotal"]
+                        if subtotal and not (isinstance(subtotal, float) and math.isnan(subtotal)):
+                            total += subtotal
+            fixed_product["total_price"] = round(total, 2)
         
-        if product.get("colors", []):
-            fixed_products.append(product)
+        # Adicionar produto fixado
+        fixed_products.append(fixed_product)
+    
+    logger.debug(f"fix_nan_in_products: retornando {len(fixed_products)} produtos corrigidos")
     
     return fixed_products

@@ -125,65 +125,39 @@ def _clean_json_string(json_str: str) -> str:
 
 
 def _sanitize_result(result: Dict[str, Any]) -> Dict[str, Any]:
-    """Sanitiza resultado removendo valores problemáticos"""
+
     if "products" not in result:
         result["products"] = []
     
     if "order_info" not in result:
         result["order_info"] = {}
     
-    # Sanitizar produtos
-    sanitized_products = []
-    
-    for product in result.get("products", []):
-        if not isinstance(product, dict) or not product.get("material_code"):
-            continue
-        
-        sanitized_product = {
-            "material_code": str(product["material_code"]).strip(),
-            "name": str(product.get("name", f"Produto {product['material_code']}")),
-            "colors": []
-        }
-        
-        # Campos opcionais
-        for field in ["category", "brand", "model"]:
-            if field in product and product[field]:
-                sanitized_product[field] = str(product[field]).strip()
-        
-        # Sanitizar cores
-        colors = product.get("colors", [])
-        if not colors:
-            colors = [{"color_code": "001", "color_name": "Padrão", "sizes": [{"size": "UN", "quantity": 1}]}]
-        
-        for color in colors:
-            if not isinstance(color, dict):
+    if "products" in result:
+        preserved = 0
+        sanitized = []
+
+        for product in result["products"]:
+            if not isinstance(product, dict):
                 continue
+
+            if not product.get("material_code"):
+                logger.warning("Produto sem código - mantido para revisão")
+                sanitized.append(product)
+                continue
+
+            # Garantir que pelo menos uma cor ou tamanho válido exista
+            has_valid_color = False
+            for color in product.get("colors", []):
+                if isinstance(color, dict) and color.get("color_code"):
+                    has_valid_color = True
+                    break
+
+            if not has_valid_color:
+                logger.warning(f"Produto {product['material_code']} sem cores válidas - mantido com aviso")
             
-            sanitized_color = {
-                "color_code": str(color.get("color_code", "001")),
-                "color_name": str(color.get("color_name", "Padrão")),
-                "sizes": []
-            }
-            
-            # Sanitizar tamanhos
-            sizes = color.get("sizes", [])
-            for size in sizes:
-                if isinstance(size, dict) and size.get("size"):
-                    try:
-                        quantity = max(0, int(size.get("quantity", 0)))
-                        sanitized_color["sizes"].append({
-                            "size": str(size["size"]),
-                            "quantity": quantity
-                        })
-                    except (ValueError, TypeError):
-                        pass
-            
-            if not sanitized_color["sizes"]:
-                sanitized_color["sizes"] = [{"size": "UN", "quantity": 1}]
-            
-            sanitized_products.append(sanitized_product)
-    
-    result["products"] = sanitized_products
+            sanitized.append(product)
+
+        result["products"] = sanitized
     return result
 
 async def recover_failed_page(api_key: str, image_path: str, original_error: str, page_number: int, context: str) -> Dict[str, Any]:

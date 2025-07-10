@@ -54,8 +54,13 @@ class ValidationAgent:
         3. Produtos duplicados por cor
         4. Alinhamento incorreto de colunas
         """
+
         logger.info("🔍 Iniciando validação específica...")
         
+        if self.should_skip_validation(products):
+            logger.info("✅ Color mapping já aplicado - produtos mantidos como estão")
+            return ValidationResult(products=products, valid=True)
+    
         validation_errors = []
         missing_fields = []
         recommendations = []
@@ -64,23 +69,28 @@ class ValidationAgent:
         quantities_corrected = 0
         products_merged = 0
         
-        # 1. CORREÇÃO ESPECÍFICA: Agrupar produtos por cor
-        logger.info("🎨 Verificando agrupamento de produtos por cor...")
-        color_grouped_products, merge_corrections = await self._fix_color_grouping(
-            extracted_products, pdf_pages
-        )
-        corrections_applied.extend(merge_corrections)
-        products_merged = len(extracted_products) - len(color_grouped_products)
+        color_grouped_products = extracted_products.copy()
+        merge_corrections = []
         
-        # 2. CORREÇÃO ESPECÍFICA: Tamanhos e quantidades
-        logger.info("📏 Corrigindo tamanhos e quantidades...")
-        size_corrected_products, size_corrections = await self._fix_sizes_and_quantities(
-            color_grouped_products, pdf_pages
-        )
+        # Só fazer correções de tamanhos e quantidades se REALMENTE necessário
+        size_corrected_products = []
+        size_corrections = []
+        
+        for product in color_grouped_products:
+            # Verificar se produto REALMENTE precisa de correção
+            if self._product_needs_size_correction(product):
+                logger.info(f"🔧 Produto {product.get('material_code')} precisa correção de tamanhos")
+                corrected_product, product_corrections = await self._fix_single_product(product, pdf_pages)
+                size_corrected_products.append(corrected_product)
+                size_corrections.extend(product_corrections)
+            else:
+                # Produto está OK, não tocar
+                size_corrected_products.append(product)
+        
         corrections_applied.extend(size_corrections)
         sizes_corrected = len([c for c in size_corrections if 'tamanho' in c.lower()])
         quantities_corrected = len([c for c in size_corrections if 'quantidade' in c.lower()])
-        
+
         # 3. Validações originais
         completeness_score = self._calculate_completeness_score(size_corrected_products)
         consistency_score = self._calculate_consistency_score(size_corrected_products)
@@ -124,6 +134,57 @@ class ValidationAgent:
             corrections_applied=corrections_applied
         )
     
+    def _create_minimal_validation_result(self, products: List[Dict], 
+                                    pdf_pages: List[Image.Image], 
+                                    context: Dict) -> ValidationResult:
+
+        logger.info("📋 Criando validação mínima para preservar color mapping")
+        
+        return ValidationResult(
+            products=products,  # Produtos sem alterações
+            confidence_score=0.95,  # Alta confiança pois color mapping funcionou
+            missing_fields=[],
+            validation_errors=[],
+            total_pages_processed=len(pdf_pages),
+            extraction_method="color_mapping_preserved",
+            completeness_score=0.9,
+            consistency_score=0.9,
+            visual_completeness_score=0.85,
+            density_score=0.8,
+            recommendations=["Color mapping aplicado corretamente - nenhuma correção necessária"],
+            sizes_corrected=0,
+            quantities_corrected=0,
+            products_merged=0,
+            corrections_applied=["Preservado color mapping existente"]
+        )
+
+    def _product_needs_size_correction(self, product: Dict[str, Any]) -> bool:
+
+        if not product.get("colors"):
+            return False
+        
+        needs_correction = False
+        
+        for color in product["colors"]:
+            sizes = color.get("sizes", [])
+            
+            # Problema 1: Todos os tamanhos têm quantidade 1 (suspeito)
+            if len(sizes) > 2:  # Só verificar se tem vários tamanhos
+                quantities = [s.get("quantity", 0) for s in sizes]
+                if len(set(quantities)) == 1 and quantities[0] == 1:
+                    logger.info(f"Suspeita: {product.get('material_code')} tem todas quantidades = 1")
+                    needs_correction = True
+                    break
+            
+            # Problema 2: Faltam tamanhos óbvios (ex: só tem M, falta S e L)
+            size_names = [s.get("size", "") for s in sizes]
+            if len(size_names) == 1 and size_names[0] in ["M", "L"]:
+                logger.info(f"Suspeita: {product.get('material_code')} só tem 1 tamanho")
+                needs_correction = True
+                break
+        
+        return needs_correction
+
     async def _fix_color_grouping(self, 
                                 products: List[Dict], 
                                 images: List[Image.Image]) -> Tuple[List[Dict], List[str]]:
@@ -234,12 +295,25 @@ class ValidationAgent:
         
         return corrected_products, corrections
     
+    def should_skip_validation(self, products: List[Dict]) -> bool:
+ 
+        # Se produtos já têm códigos de cores válidos, não validar
+        valid_codes = {"001", "002", "003", "004", "005", "006", "007", "008", "009", "010", "011", "012"}
+        
+        for product in products:
+            for color in product.get("colors", []):
+                color_code = color.get("color_code", "")
+                if color_code in valid_codes:
+                    # Se já tem códigos válidos, color mapping funcionou
+                    logger.info("✅ Color mapping já aplicado - pulando validação destrutiva")
+                    return True
+        
+        return False
+
     async def _fix_single_product(self, 
-                                product: Dict,
-                                images: List[Image.Image]) -> Tuple[Dict, List[str]]:
-        """
-        Corrige um produto específico analisando a imagem
-        """
+                            product: Dict,
+                            images: List[Image.Image]) -> Tuple[Dict, List[str]]:
+
         corrections = []
         material_code = product.get('material_code', '')
         
@@ -247,81 +321,64 @@ class ValidationAgent:
             if not images:
                 return product, corrections
             
-            # Análise específica para este produto
+            # Prompt MUITO específico e conservador
             fix_prompt = f"""
-            CORREÇÃO ESPECÍFICA DE PRODUTO - {material_code}
+            CORREÇÃO CONSERVADORA DE TAMANHOS/QUANTIDADES - {material_code}
             
-            Produto atual:
-            {json.dumps(product, indent=2)}
+            Produto: {product.get('name', '')}
             
-            PROBLEMAS A VERIFICAR:
-            1. TAMANHOS INCOMPLETOS: Faltam XS ou XL que estão visíveis?
-            2. QUANTIDADES INCORRETAS: Todas as quantidades são 1 quando deveriam ser diferentes?
-            3. ALINHAMENTO: Os tamanhos correspondem às colunas corretas?
+            IMPORTANTE: NÃO ALTERAR CORES! Só verificar tamanhos e quantidades.
             
-            TAREFA:
-            1. Localize este código ({material_code}) na imagem
-            2. Leia TODOS os tamanhos da linha (XS, S, M, L, XL, etc.)
-            3. Leia as quantidades EXATAS (incluindo 0 para tamanhos sem stock)
-            4. Verifique o alinhamento posicional
+            Cores atuais (NÃO MODIFICAR):
+            """
             
-            RESPOSTA EM JSON:
+            for i, color in enumerate(product.get('colors', [])):
+                fix_prompt += f"""
+            Cor {i+1}: {color.get('color_name', '')} (código: {color.get('color_code', '')})
+            Tamanhos: {[f"{s.get('size')}({s.get('quantity')})" for s in color.get('sizes', [])]}
+            """
+            
+            fix_prompt += f"""
+            
+            TAREFA LIMITADA:
+            1. Localize este produto na imagem
+            2. Verifique se os TAMANHOS estão corretos (não alterar cores!)
+            3. Verifique se as QUANTIDADES estão corretas
+            
+            RESPOSTA JSON (só se precisar correção):
             {{
                 "needs_correction": true/false,
-                "corrections": {{
-                    "material_code": "{material_code}",
-                    "colors": [
-                        {{
-                            "color_code": "código_da_cor",
-                            "color_name": "nome_da_cor",
-                            "unit_price": 0.0,
-                            "sizes": [
-                                {{"size": "XS", "quantity": 0}},
-                                {{"size": "S", "quantity": 1}},
-                                {{"size": "M", "quantity": 1}},
-                                {{"size": "L", "quantity": 1}},
-                                {{"size": "XL", "quantity": 0}}
-                            ]
-                        }}
-                    ]
-                }},
-                "changes_made": [
-                    "Lista de mudanças específicas feitas"
+                "reason": "Motivo específico",
+                "size_corrections": [
+                    "Falta tamanho S com quantidade X",
+                    "Tamanho XL deveria ter quantidade Y"
                 ]
             }}
             
-            IMPORTANTE: 
-            - Incluir TODOS os tamanhos visíveis (mesmo quantidade 0)
-            - Ler quantidades EXATAS da imagem
-            - Só corrigir se tiver certeza
+            Se tudo estiver correto, retorne: {{"needs_correction": false}}
             """
             
-            # Tentar com múltiplas imagens
-            for image in images:
-                try:
-                    response = self.model.generate_content([fix_prompt, image])
-                    analysis = self._extract_json_safely(response.text)
+            # Tentar análise (só primeira imagem para ser rápido)
+            try:
+                response = self.model.generate_content([fix_prompt, images[0]])
+                analysis = self._extract_json_safely(response.text)
+                
+                if analysis and analysis.get('needs_correction'):
+                    corrections_needed = analysis.get('size_corrections', [])
                     
-                    if analysis and analysis.get('needs_correction'):
-                        corrections_data = analysis.get('corrections', {})
-                        changes_made = analysis.get('changes_made', [])
+                    if corrections_needed:
+                        logger.info(f"🔧 {material_code}: Correções necessárias detectadas")
+                        for correction in corrections_needed:
+                            corrections.append(f"{material_code}: {correction}")
                         
-                        if corrections_data and changes_made:
-                            # Aplicar correções
-                            corrected_product = product.copy()
-                            corrected_product.update(corrections_data)
-                            
-                            for change in changes_made:
-                                corrections.append(f"{material_code}: {change}")
-                                logger.info(f"🔧 {material_code}: {change}")
-                            
-                            return corrected_product, corrections
-                    
-                except Exception as e:
-                    logger.warning(f"Erro ao analisar {material_code} na imagem: {e}")
-                    continue
+                        # IMPORTANTE: Não aplicar correções automaticamente
+                        # Só registrar que foram detectadas
+                        logger.warning(f"⚠️ {material_code}: Correções detectadas mas não aplicadas automaticamente")
+                
+            except Exception as e:
+                logger.warning(f"Erro na análise de {material_code}: {e}")
             
-            return product, corrections
+            return product, corrections  # Retornar produto original SEMPRE
             
         except Exception as e:
             logger.warning(f"Erro na correção de {material_code}: {e}")

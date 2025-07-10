@@ -3,7 +3,7 @@ import os
 import json
 import logging
 import time
-from typing import Dict, Any, List, Optional, Callable
+from typing import Dict, Any, List, Optional, Callable, Tuple
 import re 
 import math
 import numpy as np
@@ -936,10 +936,40 @@ class GeminiExtractor(BaseExtractor):
                     combined_result["_ai_color_mapping"] = {"error": str(e)}
             
             # Pós-processamento (mantém-se igual)
-            processed_products, determined_supplier = self._post_process_products(combined_result["products"], context_info)
+            logger.debug(f"🔍 Antes do pós-processamento: {len(combined_result['products'])} produtos")
+            
+            try:
+                result_tuple = self._post_process_products(combined_result["products"], context_info)
+                
+                # Verificar se retornou tupla corretamente
+                if isinstance(result_tuple, tuple) and len(result_tuple) == 2:
+                    processed_products, determined_supplier = result_tuple
+                    logger.debug(f"✅ Pós-processamento retornou: {len(processed_products) if processed_products else 0} produtos, fornecedor: {determined_supplier}")
+                else:
+                    logger.error(f"❌ Retorno inesperado do pós-processamento: {type(result_tuple)}")
+                    processed_products = []
+                    determined_supplier = ""
+                    
+            except Exception as e:
+                logger.error(f"❌ Erro no pós-processamento: {str(e)}")
+                import traceback
+                logger.error(traceback.format_exc())
+                processed_products = []
+                determined_supplier = context_info.get("supplier", "")
+            
             combined_result["order_info"]["supplier"] = determined_supplier
             
-            if has_json_utils:
+            # Verificar se processed_products está vazio
+            if not processed_products:
+                logger.warning(f"⚠️ Nenhum produto após pós-processamento! Verificando produtos originais...")
+                # Tentar recuperar produtos originais
+                if combined_result.get("products"):
+                    logger.info(f"🔧 Tentando usar {len(combined_result['products'])} produtos originais")
+                    processed_products = combined_result["products"]
+                else:
+                    logger.error("❌ Sem produtos para processar!")
+            
+            if has_json_utils and processed_products:
                 supplier = context_info.get("supplier", "")
                 supplier_code = get_supplier_code(supplier) if supplier else None
                 markup = 2.73
@@ -949,10 +979,13 @@ class GeminiExtractor(BaseExtractor):
                     if markup_value:
                         markup = markup_value
                 
+                produtos_antes_fix = len(processed_products)
                 processed_products = fix_nan_in_products(processed_products, markup=markup)
-                logger.info("Produtos sanitizados para evitar valores NaN no JSON")
+                produtos_depois_fix = len(processed_products) if processed_products else 0
+                
+                logger.info(f"Produtos sanitizados para evitar valores NaN no JSON: {produtos_antes_fix} → {produtos_depois_fix}")
 
-            combined_result["products"] = processed_products
+            combined_result["products"] = processed_products if processed_products else []
             logger.info(f"Pós-processamento: {len(combined_result['products'])} produtos únicos identificados")
             
             processing_time = time.time() - start_time
@@ -1059,8 +1092,10 @@ class GeminiExtractor(BaseExtractor):
             
             return {"error": error_message}
     
-    def _post_process_products(self, products: List[Dict[str, Any]], context_info: Dict[str, Any]) -> List[Dict[str, Any]]:
-        
+    def _post_process_products(self, products: List[Dict[str, Any]], context_info: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], str]:
+        """
+        Pós-processa produtos extraídos - VERSÃO CORRIGIDA
+        """
         processed_products = []
         seen_material_codes = set()
         ref_counters = {}
@@ -1072,9 +1107,15 @@ class GeminiExtractor(BaseExtractor):
         # Log do resumo da determinação
         logger.info(f"Fornecedor determinado: '{supplier_name}' (código: {supplier_code}, markup: {markup})")
         
+        # DEBUG: Log inicial
+        logger.info(f"🔍 Iniciando pós-processamento de {len(products)} produtos")
+        
         # ETAPA 2: PROCESSAR PRODUTOS (SEM LÓGICA DE FORNECEDOR INDIVIDUAL)
-        for product in products:
-            # Verificar se produto tem código de material
+        for idx, product in enumerate(products):
+            # DEBUG: Ver estrutura do produto
+            if idx == 0:  # Primeiro produto como exemplo
+                logger.debug(f"Exemplo de produto recebido: {json.dumps(product, indent=2, default=str)}")
+            
             material_code = product.get("material_code")
             if not material_code:
                 logger.warning(f"Produto sem código de material ignorado: {product.get('name', 'sem nome')}")
@@ -1084,6 +1125,7 @@ class GeminiExtractor(BaseExtractor):
             product_name = product.get("name", "")
             if product_name is None: 
                 product_name = ""
+            
             pattern = r'^([A-Za-z\s]+)(?:\s+\d+.*)?$'
             match = re.match(pattern, product_name)
             
@@ -1094,17 +1136,55 @@ class GeminiExtractor(BaseExtractor):
                 clean_name = re.sub(r'\d+', '', product_name).strip()
                 clean_name = re.sub(r'\s+', ' ', clean_name).strip()
                 product["name"] = clean_name
-                
-            # Verificar se tem cores válidas
-            has_valid_colors = False
-            if "colors" in product and isinstance(product["colors"], list):
-                for color in product["colors"]:
-                    if "sizes" in color and isinstance(color["sizes"], list) and len(color["sizes"]) > 0:
-                        has_valid_colors = True
-                        break
             
-            # Se for produto válido, verificar duplicação
-            if has_valid_colors:
+            # CORREÇÃO PRINCIPAL: Verificar estrutura de dados real
+            # Alguns produtos podem não ter a estrutura colors > sizes esperada
+            has_valid_data = False
+            has_basic_info = bool(material_code and product_name)
+            
+            # Verificar se tem estrutura de cores válida
+            if "colors" in product and isinstance(product.get("colors"), list) and len(product.get("colors")) > 0:
+                for color in product["colors"]:
+                    if isinstance(color, dict):
+                        # Verificar se tem tamanhos OU se tem informações básicas da cor
+                        if ("sizes" in color and isinstance(color.get("sizes"), list) and len(color.get("sizes")) > 0) or \
+                        (color.get("color_code") or color.get("color_name")):
+                            has_valid_data = True
+                            break
+            
+            # ALTERNATIVA: Produto pode ter estrutura diferente (sem array de cores)
+            # Verificar se tem informações de produto válidas mesmo sem estrutura de cores
+            if not has_valid_data and has_basic_info:
+                # Tentar criar estrutura de cores se não existir
+                if "colors" not in product or not product["colors"]:
+                    # Verificar se há informações de cor/tamanho no nível do produto
+                    if any(key in product for key in ["color_code", "color_name", "sizes", "quantity"]):
+                        logger.info(f"🔧 Produto {material_code}: Criando estrutura de cores")
+                        # Criar estrutura de cor única
+                        color_entry = {
+                            "color_code": product.get("color_code", "000"),
+                            "color_name": product.get("color_name", "Cor Única"),
+                            "sizes": []
+                        }
+                        
+                        # Se tem tamanhos diretos no produto
+                        if "sizes" in product and isinstance(product["sizes"], list):
+                            color_entry["sizes"] = product["sizes"]
+                        # Se tem quantidade direta no produto
+                        elif "quantity" in product:
+                            color_entry["sizes"] = [{
+                                "size": product.get("size", "UNICO"),
+                                "quantity": product.get("quantity", 0)
+                            }]
+                        
+                        product["colors"] = [color_entry]
+                        has_valid_data = True
+            
+            # DEBUG: Log do status de validação
+            logger.debug(f"Produto {material_code}: has_valid_data={has_valid_data}, has_basic_info={has_basic_info}")
+            
+            # Se for produto válido (tem dados válidos OU informações básicas)
+            if has_valid_data or has_basic_info:
                 # NORMALIZAÇÃO DE CATEGORIA
                 original_category = product.get("category", "")
                 category_upper = original_category.upper() if original_category else ""
@@ -1131,11 +1211,10 @@ class GeminiExtractor(BaseExtractor):
                 
                 # Logging para debug
                 if original_category != normalized_category:
-                    logger.info(f"Categoria normalizada: '{original_category}' → '{normalized_category}' para produto '{product['name']}'")
+                    logger.debug(f"Categoria normalizada: '{original_category}' → '{normalized_category}' para produto '{product['name']}'")
                 
                 # Verificar se já processamos este produto (pelo código de material)
                 if material_code in seen_material_codes:
-                    
                     # Mesclar com produto existente
                     for existing_product in processed_products:
                         if existing_product.get("material_code") == material_code:
@@ -1154,6 +1233,7 @@ class GeminiExtractor(BaseExtractor):
                                         if color.get("subtotal") is not None]
                             existing_product["total_price"] = sum(subtotals) if subtotals else None
                             
+                            logger.debug(f"Produto {material_code} mesclado com existente")
                             break
                 else:
                     # Novo produto, adicionar à lista de processados
@@ -1200,35 +1280,60 @@ class GeminiExtractor(BaseExtractor):
                     
                     product["references"] = product_references
                     processed_products.append(product)
+                    logger.debug(f"✅ Produto {material_code} adicionado aos processados")
+            else:
+                logger.warning(f"❌ Produto {material_code} ignorado - sem dados válidos")
+        
+        # LOG CRÍTICO: Quantos produtos foram processados
+        logger.info(f"📊 Pós-processamento concluído: {len(processed_products)} de {len(products)} produtos válidos")
         
         # ETAPA 3: ATRIBUIR FORNECEDOR A TODOS OS PRODUTOS (APENAS UMA VEZ)
-        processed_products = assign_supplier_to_products(processed_products, supplier_name, markup)
+        logger.debug(f"📦 Antes de atribuir fornecedor: {len(processed_products)} produtos")
         
-        # ETAPA 3.5: GARANTIR QUE TODOS OS CAMPOS ESTÃO CORRETOS
-        for product in processed_products:
-            # Preservar marca original se existir
-            if original_brand and original_brand not in ["", "Marca não identificada"]:
-                product["brand"] = original_brand
+        if processed_products:  # Só se houver produtos
+            # DEBUG: Verificar se assign_supplier_to_products está funcionando
+            produtos_antes = len(processed_products)
+            processed_products = assign_supplier_to_products(processed_products, supplier_name, markup)
+            produtos_depois = len(processed_products) if processed_products else 0
             
-            # Forçar o fornecedor normalizado
-            product["supplier"] = supplier_name
+            logger.debug(f"📦 Após assign_supplier_to_products: {produtos_antes} → {produtos_depois} produtos")
             
-            # Garantir que cores têm fornecedor correto
-            for color in product.get("colors", []):
-                color["supplier"] = supplier_name
-            
-            # CRÍTICO: Garantir que referências têm fornecedor correto
-            for reference in product.get("references", []):
-                reference["supplier"] = supplier_name
+            # Verificar se processed_products ainda existe e não é None
+            if not processed_products:
+                logger.error("❌ assign_supplier_to_products retornou None ou lista vazia!")
+                processed_products = []
+            else:
+                # ETAPA 3.5: GARANTIR QUE TODOS OS CAMPOS ESTÃO CORRETOS
+                for product in processed_products:
+                    # Preservar marca original se existir
+                    if original_brand and original_brand not in ["", "Marca não identificada"]:
+                        product["brand"] = original_brand
+                    
+                    # Forçar o fornecedor normalizado
+                    product["supplier"] = supplier_name
+                    
+                    # Garantir que cores têm fornecedor correto
+                    for color in product.get("colors", []):
+                        color["supplier"] = supplier_name
+                    
+                    # CRÍTICO: Garantir que referências têm fornecedor correto
+                    for reference in product.get("references", []):
+                        reference["supplier"] = supplier_name
 
-        # ETAPA 4: FINALIZAR
-        processed_products.sort(key=lambda p: p.get("material_code", ""))
+                # ETAPA 4: FINALIZAR
+                processed_products.sort(key=lambda p: p.get("material_code", ""))
+                
+                try:
+                    from app.utils.barcode_generator import add_barcodes_to_products
+                    produtos_antes_barcode = len(processed_products)
+                    processed_products = add_barcodes_to_products(processed_products)
+                    produtos_depois_barcode = len(processed_products) if processed_products else 0
+                    logger.debug(f"📦 Após add_barcodes_to_products: {produtos_antes_barcode} → {produtos_depois_barcode} produtos")
+                except ImportError:
+                    logger.warning("Módulo barcode_generator não encontrado, pulando geração de códigos de barras")
         
-        try:
-            from app.utils.barcode_generator import add_barcodes_to_products
-            processed_products = add_barcodes_to_products(processed_products)
-        except ImportError:
-            logger.warning("Módulo barcode_generator não encontrado, pulando geração de códigos de barras")
+        # LOG FINAL ANTES DE RETORNAR
+        logger.info(f"📊 Retornando {len(processed_products)} produtos processados")
         
         # RETORNAR OS DADOS PARA ATUALIZAR O ORDER_INFO NO MÉTODO PRINCIPAL
         return processed_products, supplier_name
