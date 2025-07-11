@@ -158,7 +158,7 @@ class ProcessingRecovery:
         # Remover espaços duplos que podem ter ficado
         cleaned = re.sub(r'\s+', ' ', cleaned).strip()
         
-        return cleaned
+        return cleaned.upper()
     
     @staticmethod
     def format_product_description(product_name: str, color_code: str, size: str) -> str:

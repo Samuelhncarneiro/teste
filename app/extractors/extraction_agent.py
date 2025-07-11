@@ -10,7 +10,7 @@ from PIL import Image
 from app.config import GEMINI_API_KEY, GEMINI_MODEL
 from app.utils.file_utils import optimize_image
 from app.data.reference_data import CATEGORIES
-from app.extractors.size_detection_agent import SizeDetectionAgent
+from app.utils.size_detection import SizeDetectionAgent
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +88,175 @@ class ExtractionAgent:
         except Exception as e:
             logger.error(f"Erro ao processar página {page_number}: {str(e)}")
             return {"error": str(e), "products": []}
+    
+    async def extract_from_page(self, image_path: str, context: str, page_number: int, 
+                               total_pages: int, previous_results: List[Dict]) -> Dict[str, Any]:
+        """
+        Versão melhorada com prompt focado em tamanhos
+        """
+        
+        # PROMPT MELHORADO - A chave para resolver tudo
+        enhanced_context = self._add_size_focused_instructions(context)
+        
+        try:
+            image = Image.open(image_path)
+            response = self.model.generate_content([enhanced_context, image])
+            
+            # Parse da resposta
+            result = self._parse_extraction_response(response.text)
+            
+            # USAR SEU SIZE_DETECTION_AGENT para validar/melhorar
+            if result.get('products'):
+                result['products'] = self._improve_sizes_with_your_agent(result['products'])
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Erro na extração: {e}")
+            return {"error": str(e), "products": []}
+    
+    def _improve_sizes_with_your_agent(self, products: List[Dict]) -> List[Dict]:
+        """
+        Usa seu SizeDetectionAgent para melhorar os tamanhos extraídos
+        """
+        improved_products = []
+        
+        for product in products:
+            improved_product = product.copy()
+            product_code = product.get('material_code', '')
+            category = product.get('category', '')
+            
+            for color in improved_product.get('colors', []):
+                original_sizes = color.get('sizes', [])
+                
+                if original_sizes:
+                    # USAR SEU AGENT para validar
+                    validated_sizes = self.size_detector.normalize_size_extraction(
+                        original_sizes, 
+                        category=category
+                    )
+                    
+                    if validated_sizes and len(validated_sizes) > 0:
+                        color['sizes'] = validated_sizes
+                        logger.info(f"✅ Tamanhos validados para {product_code}: {len(validated_sizes)} tamanhos")
+                        
+                        # Recalcular subtotal se necessário
+                        if 'unit_price' in color:
+                            total_qty = sum(s['quantity'] for s in validated_sizes)
+                            color['subtotal'] = color['unit_price'] * total_qty
+                    
+                    else:
+                        # Se validação rejeitar tudo, manter originais mas avisar
+                        logger.warning(f"⚠️ SizeDetectionAgent rejeitou tamanhos para {product_code}")
+                        color['sizes'] = original_sizes
+                
+                else:
+                    # Sem tamanhos originais - problema de extração
+                    logger.warning(f"❌ Nenhum tamanho extraído para {product_code}")
+                    
+                    # Fallback: criar tamanho básico baseado na categoria
+                    fallback_size = self._create_fallback_size(category)
+                    color['sizes'] = [fallback_size]
+            
+            improved_products.append(improved_product)
+        
+        return improved_products
+    
+    def _create_fallback_size(self, category: str) -> Dict[str, Any]:
+
+        category_upper = category.upper() if category else ''
+        
+        # Tamanhos padrão por categoria
+        if category_upper in ['MALHAS', 'T-SHIRTS', 'POLOS']:
+            return {"size": "M", "quantity": 1}
+        elif category_upper in ['VESTIDOS', 'SAIAS', 'CASACOS', 'BLUSAS']:
+            return {"size": "40", "quantity": 1}
+        elif category_upper in ['CALÇAS', 'JEANS']:
+            return {"size": "30", "quantity": 1}
+        else:
+            return {"size": "M", "quantity": 1}
+        
+    def _add_size_focused_instructions(self, base_context: str) -> str:
+
+        size_instructions = """
+
+        🎯 INSTRUÇÕES ULTRA-ESPECÍFICAS PARA TAMANHOS:
+
+        ## PASSO 1: ANÁLISE ESTRUTURAL DA TABELA
+        1. Identifique a PRIMEIRA LINHA (cabeçalhos da tabela)
+        2. Localize colunas que são TAMANHOS:
+        - Tamanhos por letra: XS, S, M, L, XL, XXL
+        - Tamanhos numéricos: 38, 40, 42, 44, 46, 48
+        - Qualquer número de 2 dígitos nas colunas
+        3. Memorize a POSIÇÃO de cada coluna de tamanho
+
+        ## PASSO 2: MAPEAMENTO PRODUTO-TAMANHO
+        Para cada linha de produto:
+        1. Identifique o CÓDIGO do produto (primeira coluna)
+        2. Identifique a COR do produto
+        3. Para CADA coluna de tamanho:
+        - Leia o VALOR na intersecção linha-produto × coluna-tamanho
+        - CÉLULA VAZIA ou "0" = NÃO incluir esse tamanho
+        - NÚMERO > 0 = incluir com quantidade EXATA
+
+        ## PASSO 3: REGRAS ABSOLUTAS
+
+        ❌ **JAMAIS FAÇA:**
+        - Assumir "UN" ou "UNICO" quando vê colunas de tamanhos
+        - Colocar quantity: 1 para todos sem verificar valores reais
+        - Misturar informações de produtos diferentes
+
+        ✅ **SEMPRE FAÇA:**
+        - Mapear cada intersecção individualmente
+        - Incluir apenas tamanhos com quantidade > 0
+        - Manter correspondência exata posição→tamanho→quantidade
+
+        ## EXEMPLO PRÁTICO:
+
+        Se vê esta estrutura:
+        ```
+        Model        | Color  | XS | S | M | L | XL | Qty | Price
+        CF5271MA96E  | M9799  | 1  | 1 | 1 |   |    | 3   | 71.00
+        CF5245MS019  | 94028  |    | 1 | 1 | 1 |    | 3   | 67.00
+        ```
+
+        EXTRAIR como:
+        ```json
+        {
+        "products": [
+            {
+            "material_code": "CF5271MA96E",
+            "colors": [{
+                "color_code": "M9799",
+                "sizes": [
+                {"size": "XS", "quantity": 1},
+                {"size": "S", "quantity": 1},
+                {"size": "M", "quantity": 1}
+                ]
+            }]
+            },
+            {
+            "material_code": "CF5245MS019", 
+            "colors": [{
+                "color_code": "94028",
+                "sizes": [
+                {"size": "S", "quantity": 1},
+                {"size": "M", "quantity": 1},
+                {"size": "L", "quantity": 1}
+                ]
+            }]
+            }
+        ]
+        }
+        ```
+
+        **CRÍTICO**: Se não conseguir identificar colunas de tamanhos claramente, 
+        prefira retornar tamanhos vazios a assumir "UN".
+
+        Continue com a extração seguindo rigorosamente estas regras.
+        """
+        
+        return base_context + size_instructions
     
     def _extract_headers_from_context(self, context: str) -> List[str]:
         headers_match = re.search(r'Cabeçalhos Detectados: (.+)', context)

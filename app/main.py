@@ -1,6 +1,7 @@
 # app/main.py
 import os
 import json
+import re
 import logging
 import time
 from typing import Optional, Dict, Any
@@ -224,6 +225,12 @@ class SimpleHealthChecker:
             "issues": issues
         }
 
+    def sanitize_job_id(filename: str) -> str:
+        base_name = os.path.basename(filename).split('.')[0]
+        sanitized = re.sub(r'[^\w\-]', '_', base_name)
+        sanitized = re.sub(r'_+', '_', sanitized).strip('_')
+        return sanitized
+
 # Inicializar sistemas
 logging.basicConfig(level=getattr(logging, LOG_LEVEL), format=LOG_FORMAT)
 logger = logging.getLogger(__name__)
@@ -371,8 +378,8 @@ async def process_document(
     """
     
     # Gerar job_id
-    job_id = os.path.basename(file.filename).split('.')[0]
-    
+    job_id = sanitize_job_id(file.filename)
+
     # Registrar início do processamento
     metrics.record_request_start(job_id)
     

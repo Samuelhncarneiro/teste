@@ -1,4 +1,4 @@
-# app/extractors/size_detection_agent.py
+# app/utils/size_detection.py
 
 import re
 import logging

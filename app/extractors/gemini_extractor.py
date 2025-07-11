@@ -24,6 +24,7 @@ from app.utils.barcode_generator import add_barcodes_to_extraction_result, add_b
 from app.data.reference_data import (get_supplier_code, get_markup, get_category,SUPPLIER_MAP, COLOR_MAP, SIZE_MAP,CATEGORIES)
 from app.utils.json_utils import safe_json_dump, fix_nan_in_products, sanitize_for_json
 from app.utils.supplier_assignment import determine_best_supplier, assign_supplier_to_products
+from app.data.reference_data import determine_gender_by_brand
 
 logger = logging.getLogger(__name__)
 
@@ -1093,9 +1094,7 @@ class GeminiExtractor(BaseExtractor):
             return {"error": error_message}
     
     def _post_process_products(self, products: List[Dict[str, Any]], context_info: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], str]:
-        """
-        Pós-processa produtos extraídos - VERSÃO CORRIGIDA
-        """
+
         processed_products = []
         seen_material_codes = set()
         ref_counters = {}
@@ -1125,10 +1124,10 @@ class GeminiExtractor(BaseExtractor):
             product_name = product.get("name", "")
             if product_name is None: 
                 product_name = ""
-            
+
             pattern = r'^([A-Za-z\s]+)(?:\s+\d+.*)?$'
             match = re.match(pattern, product_name)
-            
+
             if match:
                 clean_name = match.group(1).strip()
                 product["name"] = clean_name
@@ -1136,9 +1135,19 @@ class GeminiExtractor(BaseExtractor):
                 clean_name = re.sub(r'\d+', '', product_name).strip()
                 clean_name = re.sub(r'\s+', ' ', clean_name).strip()
                 product["name"] = clean_name
-            
-            # CORREÇÃO PRINCIPAL: Verificar estrutura de dados real
-            # Alguns produtos podem não ter a estrutura colors > sizes esperada
+
+            if "name" in product:
+                product["name"] = product["name"].upper()
+
+            if "brand" in product:
+                product["brand"] = product["brand"].upper()
+
+            product_brand = product.get("brand", "") or original_brand
+            product["gender"] = determine_gender_by_brand(product_brand)
+
+            if product["gender"] == "MULHER":
+                logger.info(f"Produto '{product['name']}' da marca '{product_brand}' definido como MULHER")
+
             has_valid_data = False
             has_basic_info = bool(material_code and product_name)
             
@@ -1183,7 +1192,6 @@ class GeminiExtractor(BaseExtractor):
             # DEBUG: Log do status de validação
             logger.debug(f"Produto {material_code}: has_valid_data={has_valid_data}, has_basic_info={has_basic_info}")
             
-            # Se for produto válido (tem dados válidos OU informações básicas)
             if has_valid_data or has_basic_info:
                 # NORMALIZAÇÃO DE CATEGORIA
                 original_category = product.get("category", "")
@@ -1335,5 +1343,57 @@ class GeminiExtractor(BaseExtractor):
         # LOG FINAL ANTES DE RETORNAR
         logger.info(f"📊 Retornando {len(processed_products)} produtos processados")
         
-        # RETORNAR OS DADOS PARA ATUALIZAR O ORDER_INFO NO MÉTODO PRINCIPAL
+        quality_report = self._check_size_quality(processed_products)
+        
+        if quality_report['issues_found'] > 0:
+            logger.warning(f"⚠️ {quality_report['issues_found']} problemas de tamanhos detectados")
+            for issue in quality_report['sample_issues'][:3]:
+                logger.warning(f"   - {issue}")
+        
+        logger.info(f"📊 Qualidade dos tamanhos: {quality_report['quality_score']:.1%}")
+
         return processed_products, supplier_name
+
+    def _check_size_quality(self, products: List[Dict]) -> Dict[str, Any]:
+        """
+        Verifica qualidade geral dos tamanhos extraídos
+        """
+        total_products = len(products)
+        issues = []
+        single_size_count = 0
+        uniform_quantity_count = 0
+        
+        for product in products:
+            material_code = product.get('material_code', '')
+            category = product.get('category', '').upper()
+            
+            for color in product.get('colors', []):
+                sizes = color.get('sizes', [])
+                
+                # Issue 1: Tamanho único suspeito
+                if len(sizes) == 1:
+                    size_name = sizes[0].get('size', '')
+                    if (size_name in ['UN', 'UNICO', 'UNI'] and 
+                        category in ['MALHAS', 'CAMISAS', 'VESTIDOS', 'CALÇAS']):
+                        single_size_count += 1
+                        issues.append(f"{material_code}: Tamanho único '{size_name}' para {category}")
+                
+                # Issue 2: Quantidades todas iguais (suspeito)
+                if len(sizes) > 2:
+                    quantities = [s.get('quantity', 0) for s in sizes]
+                    if len(set(quantities)) == 1 and quantities[0] == 1:
+                        uniform_quantity_count += 1
+                        issues.append(f"{material_code}: Todas quantidades = 1")
+        
+        issues_found = len(issues)
+        quality_score = max(0, 1 - (issues_found / max(1, total_products)))
+        
+        return {
+            'total_products': total_products,
+            'issues_found': issues_found,
+            'single_size_issues': single_size_count,
+            'uniform_quantity_issues': uniform_quantity_count,
+            'quality_score': quality_score,
+            'sample_issues': issues[:5]
+        }
+    

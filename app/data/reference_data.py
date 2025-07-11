@@ -165,6 +165,37 @@ SUPPLIER_DATA = {
     "35": {"nome": "MORPHOPOLIS OFICINA DE ARQUITECTURA", "marcacao": None}
 }
 
+WOMEN_ONLY_BRANDS = [
+    "MAXMARA",
+    "WEEKEND/MAXMARA", 
+    "MARELLA",
+    "ESCORPION",
+    "TWINSET",
+    "TWIN SET",
+    "PINKO",
+    "LEBEK",
+    "LEBEK FASHION"
+]
+
+def determine_gender_by_brand(brand: str) -> str:
+
+    if not brand:
+        return "HOMEM"
+    
+    brand_upper = brand.upper().strip()
+    
+    # Verificar se a marca está na lista de marcas exclusivamente femininas
+    for women_brand in WOMEN_ONLY_BRANDS:
+        if women_brand.upper() in brand_upper or brand_upper in women_brand.upper():
+            return "MULHER"
+    
+    # Verificações específicas para as 6 marcas mencionadas
+    if any(term in brand_upper for term in ["MAXMARA", "MARELLA", "ESCORPION", "TWINSET", "TWIN SET", "PINKO", "LEBEK"]):
+        return "MULHER"
+    
+    # Default para homem (todas as outras marcas)
+    return "HOMEM"
+
 # Mapeamentos simplificados para consulta rápida
 SUPPLIER_MAP = {k: v["nome"] for k, v in SUPPLIER_DATA.items()}
 SUPPLIER_CODE_MAP = {v: k for k, v in SUPPLIER_MAP.items()}
