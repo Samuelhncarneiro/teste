@@ -1,9 +1,10 @@
 # app/main.py
 import os
 import json
-import re
 import logging
 import time
+import re
+import urllib.parse
 from typing import Optional, Dict, Any
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, BackgroundTasks, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -94,8 +95,7 @@ class SimpleMetrics:
             },
             "timestamp": datetime.now().isoformat()
         }
-
-# Sistema de health check simples
+    
 class SimpleHealthChecker:
     """Health checker simples integrado"""
     
@@ -225,12 +225,6 @@ class SimpleHealthChecker:
             "issues": issues
         }
 
-    def sanitize_job_id(filename: str) -> str:
-        base_name = os.path.basename(filename).split('.')[0]
-        sanitized = re.sub(r'[^\w\-]', '_', base_name)
-        sanitized = re.sub(r'_+', '_', sanitized).strip('_')
-        return sanitized
-
 # Inicializar sistemas
 logging.basicConfig(level=getattr(logging, LOG_LEVEL), format=LOG_FORMAT)
 logger = logging.getLogger(__name__)
@@ -291,6 +285,12 @@ def get_gemini_extractor():
     """Dependência para obter o extrator Gemini"""
     return GeminiExtractor()
 
+def sanitize_job_id(filename: str) -> str:
+    base_name = os.path.basename(filename).split('.')[0]
+    sanitized = re.sub(r'[^\w\-]', '_', base_name)
+    sanitized = re.sub(r'_+', '_', sanitized).strip('_')
+    return sanitized
+    
 @app.on_event("startup")
 async def startup_event():
     logger.info("🚀 Aplicação a iniciar...")
@@ -508,23 +508,138 @@ async def get_job_excel(job_id: str, season: str = None):
 
 @app.get("/job/{job_id}/json", summary="Obter resultado em JSON")
 async def get_job_json(job_id: str):
-    """
-    📋 Retorna os resultados do job em formato JSON.
     
-    - **job_id**: ID do job
-    """
-    job = job_service.get_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job não encontrado")
+    logger.info(f"🔍 Buscando resultado JSON para: {job_id}")
     
-    if job["status"] != "completed":
-        raise HTTPException(status_code=400, detail="Job ainda em processamento")
+    # PASSO 1: Normalizar job_id e criar variações
+    job_id_variants = [
+        job_id,  # Original
+        urllib.parse.unquote(job_id),  # Decodificar URL (%20 → espaço)
+        job_id.replace('%20', ' '),  # %20 → espaço
+        job_id.replace(' ', '_'),   # espaço → underscore
+        job_id.replace('%20', '_'), # %20 → underscore
+        job_id.replace('-', '_'),   # hífen → underscore
+        job_id.replace('_', '-'),   # underscore → hífen
+        sanitize_job_id(job_id)     # Aplicar nossa função de sanitização
+    ]
     
-    if "gemini" not in job["model_results"] or "result" not in job["model_results"]["gemini"]:
-        raise HTTPException(status_code=404, detail="Resultados não disponíveis")
+    # PASSO 2: Tentar buscar job em memória
+    job = None
+    job_id_found = None
     
-    extraction_result = job["model_results"]["gemini"]["result"]
-    return JSONResponse(content=extraction_result, status_code=200)
+    for variant in job_id_variants:
+        job = job_service.get_job(variant)
+        if job:
+            job_id_found = variant
+            logger.info(f"✅ Job encontrado em memória com ID: {job_id_found}")
+            break
+    
+    # PASSO 3: Se encontrou job em memória, tentar extrair resultado
+    if job and job.get("status") == "completed":
+        model_results = job.get("model_results", {})
+        if "gemini" in model_results and "result" in model_results["gemini"]:
+            try:
+                extraction_result = model_results["gemini"]["result"]
+                logger.info(f"✅ Resultado extraído da memória para: {job_id_found}")
+                logger.info(f"📊 Produtos encontrados: {len(extraction_result.get('products', []))}")
+                return JSONResponse(content=extraction_result, status_code=200)
+            except Exception as e:
+                logger.warning(f"⚠️ Erro ao processar resultado da memória: {e}")
+    
+    # PASSO 4: FALLBACK - Buscar arquivo JSON diretamente
+    logger.info(f"🔍 Buscando arquivo JSON para: {job_id}")
+    
+    results_dir = os.path.join(os.path.dirname(CONVERTED_DIR), "results")
+    
+    # Criar variações de nomes de arquivo baseadas nas variações do job_id
+    filename_variants = []
+    for variant in job_id_variants:
+        filename_variants.extend([
+            f"{variant}_gemini.json",
+            f"{variant}.json",
+            f"gemini_{variant}.json"
+        ])
+    
+    # Tentar cada variação de arquivo
+    for filename in filename_variants:
+        json_file_path = os.path.join(results_dir, filename)
+        if os.path.exists(json_file_path):
+            try:
+                with open(json_file_path, 'r', encoding='utf-8') as f:
+                    extraction_result = json.load(f)
+                
+                logger.info(f"✅ Resultado lido do arquivo: {filename}")
+                logger.info(f"📊 Produtos encontrados: {len(extraction_result.get('products', []))}")
+                
+                # Sanitizar valores NaN se necessário
+                def sanitize_nan(obj):
+                    import math
+                    if isinstance(obj, dict):
+                        return {k: sanitize_nan(v) for k, v in obj.items()}
+                    elif isinstance(obj, list):
+                        return [sanitize_nan(item) for item in obj]
+                    elif isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+                        return 0.0
+                    else:
+                        return obj
+                
+                sanitized_result = sanitize_nan(extraction_result)
+                return JSONResponse(content=sanitized_result, status_code=200)
+                
+            except Exception as e:
+                logger.warning(f"⚠️ Erro ao ler arquivo {filename}: {e}")
+                continue
+    
+    # PASSO 5: Buscar por similaridade (último recurso)
+    if os.path.exists(results_dir):
+        try:
+            all_files = os.listdir(results_dir)
+            json_files = [f for f in all_files if f.endswith('.json')]
+            
+            logger.info(f"📁 Arquivos JSON disponíveis: {json_files}")
+            
+            # Buscar por similaridade no nome
+            target_clean = job_id.replace('-', '').replace('_', '').replace('%20', '').replace(' ', '').upper()
+            
+            for json_file in json_files:
+                file_clean = json_file.replace('-', '').replace('_', '').replace('.json', '').upper()
+                
+                # Se há semelhança significativa
+                if target_clean in file_clean or file_clean in target_clean:
+                    json_file_path = os.path.join(results_dir, json_file)
+                    try:
+                        with open(json_file_path, 'r', encoding='utf-8') as f:
+                            extraction_result = json.load(f)
+                        
+                        logger.info(f"✅ Resultado encontrado por similaridade: {json_file}")
+                        logger.info(f"📊 Produtos encontrados: {len(extraction_result.get('products', []))}")
+                        return JSONResponse(content=extraction_result, status_code=200)
+                        
+                    except Exception as e:
+                        logger.warning(f"⚠️ Erro ao ler arquivo por similaridade {json_file}: {e}")
+                        continue
+            
+        except Exception as e:
+            logger.error(f"❌ Erro ao listar arquivos na pasta results: {e}")
+    
+    # PASSO 6: Se chegou até aqui, não encontrou nada
+    logger.error(f"❌ Resultado não encontrado para job: {job_id}")
+    
+    # Debug detalhado
+    logger.error(f"🔍 Debug info:")
+    logger.error(f"   - Job ID original: {job_id}")
+    logger.error(f"   - Variações tentadas: {job_id_variants}")
+    logger.error(f"   - Job encontrado em memória: {job_id_found}")
+    logger.error(f"   - Status do job: {job.get('status') if job else 'N/A'}")
+    
+    # Listar jobs disponíveis
+    available_jobs = list(job_service.jobs.keys())
+    logger.error(f"   - Jobs em memória: {available_jobs}")
+    
+    raise HTTPException(
+        status_code=404, 
+        detail=f"Resultado não encontrado para job: {job_id}. Verifique o processamento."
+    )
 
 @app.get("/jobs", summary="Listar todos os jobs")
 async def list_jobs():

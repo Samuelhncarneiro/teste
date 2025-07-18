@@ -1073,7 +1073,7 @@ class GeminiExtractor(BaseExtractor):
                 if validated_result:
                     combined_result = validated_result
             else:
-                logger.info("✅ Color mapping preservado - pulando validação")
+                logger.info("✅ Color mapping preservado - skip validação")
                 
                 
             return combined_result

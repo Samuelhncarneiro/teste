@@ -284,91 +284,6 @@ class ExtractionAgent:
             - Procurar por códigos como: CF5015E0624, AB123456, 50469055, T3216
             - Geralmente próximo ao nome do produto ou no início da linha"""
 
-    def _create_individual_size_prompt(self, context: str, page_number: int, total_pages: int) -> str:
-
-        headers_detected = self._extract_headers_from_context(context)
-        material_code_instructions = self._get_material_code_instructions(headers_detected)
-        
-        return f"""
-        # INSTRUÇÕES PARA EXTRAÇÃO GRANULAR POR TAMANHO
-        
-        Você é um especialista em extrair dados de produtos de documentos comerciais.
-        Esta é a página {page_number} de {total_pages}.
-        
-        {context}
-        
-        ## REGRA FUNDAMENTAL: GRANULARIDADE MÁXIMA
-        
-        **CADA COMBINAÇÃO CÓDIGO+COR+TAMANHO = UM PRODUTO SEPARADO**
-        
-        **EXEMPLO DO QUE QUERO:**
-        Se vir na tabela:
-        ```
-        CF5271MA96E  Preto(M9799)   S  M  L  →  1  1  1
-        CF5271MA96E  Bege(M9990)   XS  S  M  →  1  1  1
-        ```
-        
-        **DEVE EXTRAIR 6 PRODUTOS SEPARADOS:**
-        ```json
-        [
-        {{"name": "Malha Fechada M/L", "material_code": "CF5271MA96E", "color_code": "010", "color_name": "Preto", "size": "S", "quantity": 1}},
-        {{"name": "Malha Fechada M/L", "material_code": "CF5271MA96E", "color_code": "010", "color_name": "Preto", "size": "M", "quantity": 1}},
-        {{"name": "Malha Fechada M/L", "material_code": "CF5271MA96E", "color_code": "010", "color_name": "Preto", "size": "L", "quantity": 1}},
-        {{"name": "Malha Fechada M/L", "material_code": "CF5271MA96E", "color_code": "012", "color_name": "Bege", "size": "XS", "quantity": 1}},
-        {{"name": "Malha Fechada M/L", "material_code": "CF5271MA96E", "color_code": "012", "color_name": "Bege", "size": "S", "quantity": 1}},
-        {{"name": "Malha Fechada M/L", "material_code": "CF5271MA96E", "color_code": "012", "color_name": "Bege", "size": "M", "quantity": 1}}
-        ]
-        ```
-        
-        ## ALGORITMO DE EXTRAÇÃO:
-        
-        1. **Identificar produto base** (código + nome)
-        2. **Para cada cor desse produto:**
-        3. **Para cada tamanho com quantidade > 0:**
-            4. **Criar produto individual separado**
-        
-        ## REGRAS CRÍTICAS:
-        
-        - **NUNCA** agrupar tamanhos no mesmo produto
-        - **NUNCA** agrupar cores no mesmo produto  
-        - **SEMPRE** criar produto separado para cada combinação única
-        - **SÓ** incluir tamanhos que têm quantidade explícita > 0
-        - **USAR** mapeamento posicional rigoroso (tamanho = posição da quantidade)
-        
-        {material_code_instructions}
-        
-        ## FORMATO DE RESPOSTA OBRIGATÓRIO:
-        
-        ```json
-        {{
-        "products": [
-            {{
-            "name": "Nome do produto",
-            "material_code": "Código do material",
-            "category": "Categoria em português - usar: {CATEGORIES}",
-            "model": "Modelo/descrição",
-            "composition": null,
-            "color_code": "Código da cor",
-            "color_name": "Nome da cor",
-            "size": "Tamanho específico",
-            "quantity": 1,
-            "unit_price": 0.0,
-            "sales_price": 0.0
-            }}
-        ]
-        }}
-        ```
-        
-        ## VERIFICAÇÕES OBRIGATÓRIAS:
-        
-        ✅ Cada objeto no array "products" tem APENAS 1 tamanho
-        ✅ Cada objeto no array "products" tem APENAS 1 cor
-        ✅ Tamanhos sem quantidade NÃO são incluídos
-        ✅ Mapeamento posicional correto entre tamanho e quantidade
-        
-        EXTRAIA AGORA seguindo RIGOROSAMENTE estas regras.
-        """
-        
     def _create_first_page_prompt(
         self, context: str, page_number: int, total_pages: int, json_template: str
     ) -> str:
@@ -387,21 +302,93 @@ class ExtractionAgent:
         
         ## REGRAS CRÍTICAS PARA TAMANHOS:
     
-        **MAPEAMENTO POSICIONAL**: Quando vir tamanhos em uma linha e quantidades em outra:
+        ### PROBLEMA 1: TAMANHOS INCORRETOS ("UN" em vez dos tamanhos reais)
+        **SOLUÇÃO - ALGORITMO DE MAPEAMENTO POSICIONAL**:
         
-        EXEMPLO:
-        ```
-        XS   S    M    L    XL   XXL
-            1    1    1
-        ```
-        ➜ INTERPRETAR: S=1, M=1, L=1 (XS, XL, XXL = SEM quantidade = NÃO incluir)
+        1. **IDENTIFICAR ESTRUTURA DE TAMANHOS** na tabela:
+           - Procurar colunas com números: 34,36,38,40,42,44,46,48 (roupas)
+           - Procurar colunas com letras: XS,S,M,L,XL,XXL (t-shirts/malhas)
+           - Procurar colunas com tamanhos de calças: 24,25,26,27,28,29,30,31,32
         
-        **ALGORITMO**:
-        1. Identificar linha com tamanhos
-        2. Localizar linha com quantidades (normalmente seguinte)
-        3. Mapear por posição: quantidade corresponde ao tamanho na mesma coluna
-        4. Incluir APENAS tamanhos que têm quantidade > 0
-        5. Ignorar células vazias ou quantidades zero
+        2. **MAPEAR QUANTIDADES POR POSIÇÃO**:
+           ```
+           Exemplo visual:
+           CABEÇALHOS:    | 38 | 40 | 42 | 44 | 46 | 48 |
+           QUANTIDADES:   | 1  |    | 2  |    | 1  |    |
+           ```
+           ➜ INTERPRETAR: 38→1, 42→2, 46→1 (ignorar colunas vazias)
+           
+           **NUNCA usar tamanho "UN" para roupas!**
+        
+        3. **VALIDAR TAMANHOS POR CATEGORIA**:
+           - VESTIDOS/BLUSAS/CASACOS: 34-48 ou XS-XL
+           - CALÇAS/JEANS: 24-32 ou W28-W36  
+           - MALHAS/T-SHIRTS: XS-XXL
+           - "UN" só para acessórios especiais (cintos, carteiras)
+        
+        ### PROBLEMA 2: CORES EM FALTA (NULL em vez das cores visíveis)
+        **SOLUÇÃO - EXTRAIR SEMPRE CÓDIGO E NOME**:
+        
+        1. **LOCALIZAR INFORMAÇÃO DE COR**:
+           - Coluna "Color" ou "Cor"
+           - Junto ao código do produto
+           - Em linha separada
+        
+        2. **EXTRAIR AMBOS CÓDIGO E NOME**:
+           - "X0707 Asparago" → color_code="X0707", color_name="Asparago"
+           - "22222 Nero" → color_code="22222", color_name="Nero"
+           - "94028 Blu marino" → color_code="94028", color_name="Blu marino"
+           - Se só há código, investigar nome na linha/contexto
+           - Se só há nome, investigar código na linha/contexto
+        
+        3. **PADRÕES DE CÓDIGOS COMUNS**:
+           - Alfanuméricos: X0707, M9990, C3831, V9414
+           - Numéricos: 22222, 94028, 02056, 03243
+           - **NUNCA deixar color_name como NULL se há informação visível**
+        
+        ### PROBLEMA 3: AGRUPAMENTO INCORRETO
+        **SOLUÇÃO - AGRUPAR VARIANTES POR COR**:
+        
+        Se vir códigos como CF5271MA96E.1, CF5271MA96E.2:
+        ➜ AGRUPAR em UM produto CF5271MA96E com múltiplas cores
+        
+        ##  ALGORITMO PASSO-A-PASSO:
+        
+        ### PASSO 1: IDENTIFICAR ESTRUTURA
+        1. Localizar tabela principal de produtos
+        2. Identificar colunas de tamanhos (números ou letras)
+        3. Identificar onde estão as cores (código + nome)
+        4. Identificar onde estão as quantidades
+        
+        ### PASSO 2: EXTRAIR CADA PRODUTO
+        Para cada linha/bloco de produto:
+        1. **Código**: CF5015E0624, CF5271MA96E, etc.
+        2. **Nome**: Traduzir para português se necessário
+        3. **Cores**: Extrair código E nome da cor
+        4. **Tamanhos**: Mapear posicionalmente com quantidades
+        5. **Preços**: Extrair preços visíveis
+        
+        ### PASSO 3: VALIDAR E AGRUPAR
+        1. Verificar tamanhos realistas
+        2. Verificar cores completas
+        3. Agrupar produtos com mesmo código base
+        4. Incluir apenas tamanhos com quantidade > 0
+        
+        ## EXEMPLOS PRÁTICOS:
+        
+        ### Exemplo 1: Linha Simples
+        ```
+        CF5015E0624 | X0707 Asparago | 40 | 42 |    | 44 |
+                    |                | 1  | 1  |    |    |
+        ```
+        ➜ RESULTADO: sizes: [{{"size":"40","quantity":1}}, {{"size":"42","quantity":1}}]
+        
+        ### Exemplo 2: Múltiplas Cores
+        ```
+        CF5271MA96E | M9990 Bege  | XS:1 | S:1 | M:1 | L:3 |
+        CF5271MA96E | 22222 Preto | XS:1 | S:1 | M:1 |     |
+        ```
+        ➜ AGRUPAR em UM produto com 2 cores
 
         ## PADRÕES COMUNS DE CÓDIGOS DE PRODUTOS:
             - Alfanuméricos: CF5015E0624, AB123456, T3216
@@ -432,6 +419,15 @@ class ExtractionAgent:
         4. Utilize NULL para campos não encontrados, mas mantenha a estrutura JSON
         5. Preste atenção especial a como as cores são organizadas conforme as instruções
         6. NÃO invente dados ou adicione produtos que não estão claramente na imagem
+        7. **NUNCA usar tamanho "UN"** para roupas (vestidos, blusas, calças, etc.)
+        8. **SEMPRE extrair código E nome** da cor se visível
+        9. **MAPEAR tamanhos por posição** nas colunas
+        10. **SÓ incluir tamanhos com quantidade > 0**
+        11. **AGRUPAR produtos** com mesmo código base
+        12. **TRADUZIR nomes** para português
+
+        ## Tarefa
+        Analise a imagem seguindo RIGOROSAMENTE estas instruções e extraia todos os produtos.
 
         ## Formato de Resposta
         Retorne os dados extraídos em formato JSON estrito:
@@ -457,21 +453,93 @@ class ExtractionAgent:
         
         ## REGRAS CRÍTICAS PARA TAMANHOS:
     
-        **MAPEAMENTO POSICIONAL**: Quando vir tamanhos em uma linha e quantidades em outra:
+        ### PROBLEMA 1: TAMANHOS INCORRETOS ("UN" em vez dos tamanhos reais)
+        **SOLUÇÃO - ALGORITMO DE MAPEAMENTO POSICIONAL**:
         
-        EXEMPLO:
-        ```
-        XS   S    M    L    XL   XXL
-            1    1    1
-        ```
-        ➜ INTERPRETAR: S=1, M=1, L=1 (XS, XL, XXL = SEM quantidade = NÃO incluir)
+        1. **IDENTIFICAR ESTRUTURA DE TAMANHOS** na tabela:
+           - Procurar colunas com números: 34,36,38,40,42,44,46,48 (roupas)
+           - Procurar colunas com letras: XS,S,M,L,XL,XXL (t-shirts/malhas)
+           - Procurar colunas com tamanhos de calças: 24,25,26,27,28,29,30,31,32
         
-        **ALGORITMO**:
-        1. Identificar linha com tamanhos
-        2. Localizar linha com quantidades (normalmente seguinte)
-        3. Mapear por posição: quantidade corresponde ao tamanho na mesma coluna
-        4. Incluir APENAS tamanhos que têm quantidade > 0
-        5. Ignorar células vazias ou quantidades zero
+        2. **MAPEAR QUANTIDADES POR POSIÇÃO**:
+           ```
+           Exemplo visual:
+           CABEÇALHOS:    | 38 | 40 | 42 | 44 | 46 | 48 |
+           QUANTIDADES:   | 1  |    | 2  |    | 1  |    |
+           ```
+           ➜ INTERPRETAR: 38→1, 42→2, 46→1 (ignorar colunas vazias)
+           
+           **NUNCA usar tamanho "UN" para roupas!**
+        
+        3. **VALIDAR TAMANHOS POR CATEGORIA**:
+           - VESTIDOS/BLUSAS/CASACOS: 34-48 ou XS-XL
+           - CALÇAS/JEANS: 24-32 ou W28-W36  
+           - MALHAS/T-SHIRTS: XS-XXL
+           - "UN" só para acessórios especiais (cintos, carteiras)
+        
+        ### PROBLEMA 2: CORES EM FALTA (NULL em vez das cores visíveis)
+        **SOLUÇÃO - EXTRAIR SEMPRE CÓDIGO E NOME**:
+        
+        1. **LOCALIZAR INFORMAÇÃO DE COR**:
+           - Coluna "Color" ou "Cor"
+           - Junto ao código do produto
+           - Em linha separada
+        
+        2. **EXTRAIR AMBOS CÓDIGO E NOME**:
+           - "X0707 Asparago" → color_code="X0707", color_name="Asparago"
+           - "22222 Nero" → color_code="22222", color_name="Nero"
+           - "94028 Blu marino" → color_code="94028", color_name="Blu marino"
+           - Se só há código, investigar nome na linha/contexto
+           - Se só há nome, investigar código na linha/contexto
+        
+        3. **PADRÕES DE CÓDIGOS COMUNS**:
+           - Alfanuméricos: X0707, M9990, C3831, V9414
+           - Numéricos: 22222, 94028, 02056, 03243
+           - **NUNCA deixar color_name como NULL se há informação visível**
+        
+        ### PROBLEMA 3: AGRUPAMENTO INCORRETO
+        **SOLUÇÃO - AGRUPAR VARIANTES POR COR**:
+        
+        Se vir códigos como CF5271MA96E.1, CF5271MA96E.2:
+        ➜ AGRUPAR em UM produto CF5271MA96E com múltiplas cores
+        
+        ##  ALGORITMO PASSO-A-PASSO:
+        
+        ### PASSO 1: IDENTIFICAR ESTRUTURA
+        1. Localizar tabela principal de produtos
+        2. Identificar colunas de tamanhos (números ou letras)
+        3. Identificar onde estão as cores (código + nome)
+        4. Identificar onde estão as quantidades
+        
+        ### PASSO 2: EXTRAIR CADA PRODUTO
+        Para cada linha/bloco de produto:
+        1. **Código**: CF5015E0624, CF5271MA96E, etc.
+        2. **Nome**: Traduzir para português se necessário
+        3. **Cores**: Extrair código E nome da cor
+        4. **Tamanhos**: Mapear posicionalmente com quantidades
+        5. **Preços**: Extrair preços visíveis
+        
+        ### PASSO 3: VALIDAR E AGRUPAR
+        1. Verificar tamanhos realistas
+        2. Verificar cores completas
+        3. Agrupar produtos com mesmo código base
+        4. Incluir apenas tamanhos com quantidade > 0
+        
+        ## EXEMPLOS PRÁTICOS:
+        
+        ### Exemplo 1: Linha Simples
+        ```
+        CF5015E0624 | X0707 Asparago | 40 | 42 |    | 44 |
+                    |                | 1  | 1  |    |    |
+        ```
+        ➜ RESULTADO: sizes: [{{"size":"40","quantity":1}}, {{"size":"42","quantity":1}}]
+        
+        ### Exemplo 2: Múltiplas Cores
+        ```
+        CF5271MA96E | M9990 Bege  | XS:1 | S:1 | M:1 | L:3 |
+        CF5271MA96E | 22222 Preto | XS:1 | S:1 | M:1 |     |
+        ```
+        ➜ AGRUPAR em UM produto com 2 cores
 
         ## PADRÕES COMUNS DE CÓDIGOS DE PRODUTOS:
             - Alfanuméricos: CF5015E0624, AB123456, T3216
@@ -502,6 +570,12 @@ class ExtractionAgent:
         4. Utilize NULL para campos não encontrados, mas mantenha a estrutura JSON
         5. Preste atenção especial a como as cores são organizadas conforme as instruções
         6. NÃO invente dados ou adicione produtos que não estão claramente na imagem
+        7. **NUNCA usar tamanho "UN"** para roupas (vestidos, blusas, calças, etc.)
+        8. **SEMPRE extrair código E nome** da cor se visível
+        9. **MAPEAR tamanhos por posição** nas colunas
+        10. **SÓ incluir tamanhos com quantidade > 0**
+        11. **AGRUPAR produtos** com mesmo código base
+        12. **TRADUZIR nomes** para português
 
         ## Formato de Resposta
         Retorne os dados extraídos em formato JSON estrito:

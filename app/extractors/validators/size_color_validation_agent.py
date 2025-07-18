@@ -24,13 +24,6 @@ class SizeColorValidationResult:
     color_grouping_issues: List[str]
 
 class SizeColorValidationAgent:
-    """
-    Agente especializado em validar e corrigir problemas de:
-    1. Alinhamento de tamanhos com quantidades
-    2. Agrupamento correto de cores por produto
-    3. Mapeamento posicional de colunas
-    """
-    
     def __init__(self, api_key: str = GEMINI_API_KEY):
         self.api_key = api_key
         genai.configure(api_key=self.api_key)
